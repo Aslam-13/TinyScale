@@ -9,9 +9,13 @@ import { urlRoutes } from "./modules/url/url.routes.js";
 import { statsRoutes } from "./modules/stats/stats.routes.js";
 import { apiKeyAuth } from "./middleware/api-key-auth.js";
 
-export async function buildApp() {
+export interface BuildAppOptions {
+  logger?: boolean | object;
+}
+
+export async function buildApp(opts: BuildAppOptions = {}) {
   const app = Fastify({
-    logger: {
+    logger: opts.logger ?? {
       level: "info",
     },
   }).withTypeProvider<TypeBoxTypeProvider>();

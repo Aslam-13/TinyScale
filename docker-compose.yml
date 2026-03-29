@@ -1,0 +1,80 @@
+# --- START OF docker-compose.yml (create this file: TinyScale/docker-compose.yml) ---
+services:
+  # ---- YOUR APP ----
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+      JWT_SECRET: docker-dev-secret-change-in-production
+      PORT: 3000
+      HOST: 0.0.0.0
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - tinyscale-network
+    restart: unless-stopped
+    # restart: unless-stopped means if the container crashes, Docker restarts it
+    # unless YOU manually stopped it with docker-compose stop.
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    command: ["npx", "drizzle-kit", "push", "--config=drizzle.config.ts"]
+    environment:
+      DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - tinyscale-network
+        
+  # ---- POSTGRESQL ----
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: tinyscale
+    ports:
+      - "5433:5432"
+      # Map to 5433 on host so it doesn't conflict with your local Postgres on 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Named volume = data persists even if container is destroyed
+      # /var/lib/postgresql/data is where Postgres stores its files INSIDE the container
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d tinyscale"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      # healthcheck = Docker checks if Postgres is actually ready, not just running
+      # pg_isready is a Postgres utility that checks if the server accepts connections
+      # Without this, your app might start before Postgres is ready → crash
+    networks:
+      - tinyscale-network
+
+# ---- VOLUMES ----
+volumes:
+  pgdata:
+    # This creates a Docker-managed volume on your machine.
+    # Even if you `docker-compose down`, data stays.
+    # To DELETE data: docker-compose down -v (the -v flag removes volumes)
+
+# ---- NETWORKS ----
+networks:
+  tinyscale-network:
+    driver: bridge
+    # bridge network = containers can talk to each other by service NAME
+    # Your app connects to "db:5432" — Docker resolves "db" to the container's IP
+    # This is Docker's built-in DNS. No IP addresses needed.
+# --- END OF docker-compose.yml ---

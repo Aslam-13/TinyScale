@@ -1,0 +1,568 @@
+================================================================================
+                    WEEK 2: DOCKER + NGINX + PROPER DEPLOYMENT
+                    ==========================================
+                    Your Goal: Containerize TinyScale and understand
+                    what happens between "user types URL" and "your code runs"
+================================================================================
+
+
+================================================================================
+DAY 1-2: DOCKER (Not just docker-compose up)
+================================================================================
+
+BEFORE YOU TOUCH ANY COMMANDS - READ AND UNDERSTAND THIS:
+----------------------------------------------------------
+
+>> WHAT IS A CONTAINER? <<
+
+Think of your laptop. It has an OS (Windows 11), it runs PostgreSQL, Node.js,
+and your TinyScale app. Everything shares the same filesystem, same network,
+same process list.
+
+Now imagine you could create a "mini computer" INSIDE your computer that:
+- Has its own filesystem (can't see your Desktop files)
+- Has its own process list (can't see your Chrome)
+- Has its own network (has its own IP address)
+- But SHARES the same OS kernel (unlike a VM which needs a whole separate OS)
+
+That's a container. It's NOT a virtual machine. A VM runs a complete OS
+(boots up Linux inside Windows). A container just isolates processes using
+Linux kernel features.
+
+>> HOW? Two Linux kernel features: <<
+
+1. NAMESPACES - Isolation
+   - PID namespace: Container sees only its own processes (PID 1 is your app)
+   - Network namespace: Container has its own IP, ports, routing table
+   - Mount namespace: Container has its own filesystem view
+   - User namespace: Container has its own root user (not your real root)
+
+2. CGROUPS (Control Groups) - Resource Limits
+   - Limit how much CPU a container can use
+   - Limit how much RAM a container can use
+   - This is why you can run 10 containers without one eating all your RAM
+
+>> DOCKER is just a tool that makes creating containers easy. <<
+   Without Docker, you'd have to manually set up namespaces and cgroups.
+   Docker does it with one command.
+
+>> WHY CONTAINERS FOR TINYSCALE? <<
+
+Right now, to run TinyScale on a new machine, someone needs to:
+1. Install Node.js (correct version)
+2. Install PostgreSQL (correct version, create user, create database)
+3. Run npm install (hope native modules compile correctly)
+4. Set up environment variables
+5. Run migrations
+6. Start the server
+
+With Docker: `docker-compose up` — Done. Works the same everywhere.
+
+
+================================================================================
+STEP 1: INSTALL DOCKER DESKTOP (if not already installed)
+================================================================================
+
+1. Go to: https://www.docker.com/products/docker-desktop/
+2. Download Docker Desktop for Windows
+3. Install it (it will enable WSL2 if not already enabled)
+4. Restart your computer if prompted
+5. Open Docker Desktop and wait for it to start
+
+VERIFY IT WORKS - Open your terminal (Git Bash) and run:
+
+    docker --version
+    docker compose version
+
+You should see version numbers. If not, Docker Desktop isn't running.
+
+Also run:
+    docker run hello-world
+
+This pulls a tiny test image and runs it. If you see "Hello from Docker!"
+then everything is working.
+
+>> WHAT JUST HAPPENED with `docker run hello-world`? <<
+1. Docker looked for image "hello-world" locally — didn't find it
+2. Pulled it from Docker Hub (like npm registry but for container images)
+3. Created a container from that image
+4. Ran the container (which printed the message)
+5. Container exited (it's done, process finished)
+
+Run: docker ps -a
+You'll see the stopped hello-world container. `docker ps` shows only RUNNING
+containers. `-a` shows ALL (including stopped ones).
+
+Clean up: docker rm $(docker ps -aq)   (removes all stopped containers)
+
+
+================================================================================
+STEP 2: UNDERSTAND DOCKER IMAGES vs CONTAINERS
+================================================================================
+
+IMAGE = A blueprint/template. Like a class in OOP.
+CONTAINER = A running instance. Like an object created from a class.
+
+You can create multiple containers from one image.
+Images are built in LAYERS (each instruction in Dockerfile = one layer).
+
+Example:
+  Layer 1: node:22-alpine (base OS + Node.js)
+  Layer 2: COPY package.json (your dependencies list)
+  Layer 3: RUN npm install (installed node_modules)
+  Layer 4: COPY . . (your source code)
+
+WHY LAYERS MATTER:
+If you change your source code, Docker only rebuilds Layer 4.
+Layers 1-3 are cached. This makes rebuilds FAST.
+BUT — if you change package.json, layers 3 AND 4 rebuild.
+That's why you COPY package.json BEFORE copying source code.
+
+
+================================================================================
+STEP 3: WRITE YOUR DOCKERFILE FROM SCRATCH
+================================================================================
+
+Create a file called `Dockerfile` (no extension) in the TinyScale root.
+DO NOT COPY PASTE. TYPE EVERY LINE. Read the explanation for each line.
+
+--- START OF DOCKERFILE (create this file: TinyScale/Dockerfile) ---
+
+# ============================================
+# STAGE 1: BUILD
+# ============================================
+# We use a "builder" stage to compile TypeScript → JavaScript
+# This stage has dev dependencies (typescript, tsx, etc.)
+# We'll throw this stage away — it won't be in the final image
+
+FROM node:22-alpine AS builder
+# FROM = base image. node:22-alpine is Node.js 22 on Alpine Linux.
+# Alpine Linux is TINY (~5MB vs ~900MB for Ubuntu). Smaller = faster pulls, less attack surface.
+# "AS builder" = we're naming this stage so we can reference it later.
+
+WORKDIR /app
+# WORKDIR = sets the working directory inside the container.
+# All subsequent commands run inside /app.
+# Like doing: mkdir -p /app && cd /app
+
+COPY package.json package-lock.json ./
+# COPY = copies files from your machine INTO the container.
+# We copy package files FIRST (before source code) for layer caching.
+# If package.json hasn't changed, npm install layer is cached = fast rebuilds.
+
+RUN npm ci
+# RUN = execute a command during image build.
+# `npm ci` (not `npm install`) = clean install from lockfile.
+# npm ci is deterministic — same lockfile = same node_modules every time.
+# npm install might update lockfile. In Docker builds, use npm ci.
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+# Now copy TypeScript config and source code.
+# We DON'T copy node_modules, .git, .env, tests — see .dockerignore.
+
+RUN npm run build
+# Compile TypeScript to JavaScript.
+# Output goes to ./dist/ (based on your tsconfig.json outDir).
+
+# ============================================
+# STAGE 2: PRODUCTION
+# ============================================
+# This is the FINAL image that actually runs.
+# It's much smaller because it only has production dependencies.
+
+FROM node:22-alpine AS production
+# Fresh base image. The builder stage is discarded.
+# This is called a MULTI-STAGE BUILD.
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+
+RUN npm ci --omit=dev
+# --omit=dev = skip devDependencies (typescript, vitest, etc.)
+# Production image doesn't need build tools.
+# This makes the image MUCH smaller.
+
+COPY --from=builder /app/dist ./dist
+# COPY --from=builder = copy files from the builder stage.
+# We only take the compiled JavaScript, not the TypeScript source.
+
+COPY drizzle/ ./drizzle/
+# Copy database migration files (if you have generated migrations).
+# If you don't have a drizzle/ folder yet, remove this line for now.
+
+# Create a non-root user for security.
+# Running as root inside a container is a security risk.
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+# Now the app runs as "appuser", not root.
+# Even if someone exploits your app, they don't have root access.
+
+EXPOSE 3000
+# EXPOSE = documentation that this container listens on port 3000.
+# It doesn't actually open the port — that's done with -p flag or docker-compose.
+
+ENV NODE_ENV=production
+
+CMD ["node", "dist/server.js"]
+# CMD = the command that runs when the container starts.
+# This is your entry point — starts the Fastify server.
+
+--- END OF DOCKERFILE ---
+
+
+>> WHY MULTI-STAGE BUILD? <<
+
+Without multi-stage (single FROM):
+  - Final image has TypeScript source + devDependencies + compiled JS
+  - Image size: ~400-500MB
+
+With multi-stage (two FROMs):
+  - Final image has ONLY compiled JS + production dependencies
+  - Image size: ~150-200MB
+
+Smaller images = faster deployments, less storage, smaller attack surface.
+
+Try this after building: compare image sizes (we'll build soon).
+
+
+================================================================================
+STEP 4: CREATE .dockerignore
+================================================================================
+
+Create a file called `.dockerignore` in the TinyScale root:
+
+--- START OF .dockerignore (create this file: TinyScale/.dockerignore) ---
+node_modules
+dist
+.git
+.env
+*.md
+tests
+coverage
+.vscode
+--- END OF .dockerignore ---
+
+This is like .gitignore but for Docker. When you `COPY . .`, these files
+are excluded. This prevents:
+- Copying your huge node_modules (container installs its own)
+- Copying .env with secrets into the image
+- Copying unnecessary files that increase image size
+
+
+================================================================================
+STEP 5: BUILD YOUR DOCKER IMAGE
+================================================================================
+
+Open terminal in the TinyScale root directory and run:
+
+    docker build -t tinyscale:latest .
+
+Let's break this down:
+  docker build = build an image from a Dockerfile
+  -t tinyscale:latest = tag (name) the image as "tinyscale" with version "latest"
+  . = build context is the current directory (where Dockerfile is)
+
+WATCH THE OUTPUT CAREFULLY. You'll see:
+  - Each step corresponds to a line in your Dockerfile
+  - Layers being created and cached
+  - The multi-stage build (builder stage, then production stage)
+
+If it fails, READ THE ERROR. Common issues:
+  - tsconfig.json `outDir` not set to "dist" → check your tsconfig
+  - Missing package-lock.json → run `npm install` first to generate it
+  - If no drizzle/ folder exists, remove the `COPY drizzle/` line from Dockerfile
+
+After successful build, run:
+
+    docker images
+
+You'll see your image listed with its size. Note the size — we'll compare later.
+
+
+================================================================================
+STEP 6: TEST YOUR IMAGE (standalone, without database)
+================================================================================
+
+Try running it:
+
+    docker run --rm -p 3000:3000 tinyscale:latest
+
+This will probably CRASH. Why? Because your app tries to connect to PostgreSQL
+at localhost:5432, but there's no PostgreSQL inside this container!
+
+The error will say something like "connection refused" or "ECONNREFUSED".
+
+This is expected and important to understand:
+  - Inside the container, "localhost" means the container itself, NOT your machine
+  - Your PostgreSQL is running on your HOST machine, not inside the container
+  - Containers are isolated — they can't see host services by default
+
+Press Ctrl+C to stop it. This is why we need docker-compose — to run
+PostgreSQL as another container and let them talk to each other.
+
+
+================================================================================
+STEP 7: WRITE docker-compose.yml
+================================================================================
+
+Create `docker-compose.yml` in TinyScale root:
+
+--- START OF docker-compose.yml (create this file: TinyScale/docker-compose.yml) ---
+services:
+  # ---- YOUR APP ----
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+      JWT_SECRET: docker-dev-secret-change-in-production
+      PORT: 3000
+      HOST: 0.0.0.0
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - tinyscale-network
+    restart: unless-stopped
+    # restart: unless-stopped means if the container crashes, Docker restarts it
+    # unless YOU manually stopped it with docker-compose stop.
+
+  # ---- POSTGRESQL ----
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: tinyscale
+    ports:
+      - "5433:5432"
+      # Map to 5433 on host so it doesn't conflict with your local Postgres on 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Named volume = data persists even if container is destroyed
+      # /var/lib/postgresql/data is where Postgres stores its files INSIDE the container
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d tinyscale"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      # healthcheck = Docker checks if Postgres is actually ready, not just running
+      # pg_isready is a Postgres utility that checks if the server accepts connections
+      # Without this, your app might start before Postgres is ready → crash
+    networks:
+      - tinyscale-network
+
+# ---- VOLUMES ----
+volumes:
+  pgdata:
+    # This creates a Docker-managed volume on your machine.
+    # Even if you `docker-compose down`, data stays.
+    # To DELETE data: docker-compose down -v (the -v flag removes volumes)
+
+# ---- NETWORKS ----
+networks:
+  tinyscale-network:
+    driver: bridge
+    # bridge network = containers can talk to each other by service NAME
+    # Your app connects to "db:5432" — Docker resolves "db" to the container's IP
+    # This is Docker's built-in DNS. No IP addresses needed.
+--- END OF docker-compose.yml ---
+
+
+>> KEY THINGS TO UNDERSTAND: <<
+
+1. NETWORKING:
+   Your app's DATABASE_URL uses `db` as hostname, not `localhost`.
+   Docker networking resolves "db" to the IP of the postgres container.
+   Both containers are on "tinyscale-network" so they can find each other.
+
+2. VOLUMES:
+   `pgdata:/var/lib/postgresql/data` is a NAMED VOLUME.
+   - Container filesystem is ephemeral — if container is destroyed, data is gone
+   - Volumes persist data outside the container lifecycle
+   - `docker volume ls` shows all volumes
+   - `docker volume inspect pgdata` shows where it's stored on your machine
+
+3. DEPENDS_ON with HEALTHCHECK:
+   `depends_on: db: condition: service_healthy` means:
+   - Don't start the app until Postgres healthcheck passes
+   - Without this, app starts immediately, Postgres isn't ready, app crashes
+
+4. PORT MAPPING (5433:5432):
+   - Container internally uses 5432 (Postgres default)
+   - We map it to 5433 on the HOST to avoid conflict with your local Postgres
+   - Your app (inside Docker network) connects on 5432 (container-to-container)
+   - You (from your machine) connect on 5433 (host-to-container)
+
+
+================================================================================
+STEP 8: HANDLE DATABASE MIGRATIONS
+================================================================================
+
+Your app needs the database tables to exist. You have a few options:
+
+OPTION A (Recommended for development):
+Add a migration step to docker-compose. Add this service:
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    command: ["npx", "drizzle-kit", "push"]
+    environment:
+      DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - tinyscale-network
+
+This runs `drizzle-kit push` against the Dockerized Postgres before your app
+tries to use it. Add this to the `services:` section.
+
+NOTE: `target: builder` means use the builder stage (which has devDependencies
+including drizzle-kit). The production stage doesn't have drizzle-kit.
+
+
+================================================================================
+STEP 9: RUN EVERYTHING
+================================================================================
+
+In the TinyScale root, run:
+
+    docker compose up --build
+
+  --build = rebuild images (always use this when you've changed code or Dockerfile)
+
+WATCH THE LOGS. You should see:
+1. Postgres starting up and becoming healthy
+2. Migration running (creating tables)
+3. Your app starting and listening on port 3000
+
+TEST IT:
+
+    curl http://localhost:3000/healthcheck
+
+You should get: {"status":"ok"}
+
+If it works — congratulations! Your entire app is containerized.
+
+Try the full flow:
+    # Register a user
+    curl -X POST http://localhost:3000/api/auth/register \
+      -H "Content-Type: application/json" \
+      -d '{"email":"docker@test.com","password":"test1234"}'
+
+    # Login
+    curl -X POST http://localhost:3000/api/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"email":"docker@test.com","password":"test1234"}'
+
+    # Use the token from login to shorten a URL
+    curl -X POST http://localhost:3000/api/shorten \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI0MDlmZGVhMC1lOGYwLTRlMWItYmE5Yy00MTgwNDA5YWZkOGIiLCJpYXQiOjE3NzQ3MTI0NTgsImV4cCI6MTc3NTMxNzI1OH0.XInN22ljwW3wmhEr-K10bUKT8JmfpM1S-L08RSs0490" \
+      -d '{"url":"https://www.google.com"}'
+
+
+================================================================================
+STEP 10: EXPLORE AND UNDERSTAND
+================================================================================
+
+While everything is running, explore:
+
+1. See running containers:
+       docker compose ps
+
+2. See logs:
+       docker compose logs app      (just your app's logs)
+       docker compose logs db       (just Postgres logs)
+       docker compose logs -f       (follow ALL logs in real-time)
+
+3. Go INSIDE a running container:
+       docker compose exec app sh
+   Now you're inside the container! Try:
+       ls            (see the files — only dist/ and node_modules/)
+       whoami        (should show "appuser", not root)
+       cat /etc/os-release   (Alpine Linux)
+       exit          (leave the container)
+
+4. Go inside the Postgres container:
+       docker compose exec db psql -U dev tinyscale
+   Now you're in the Postgres CLI inside the container:
+       \dt           (show tables — should show urls, users, clicks)
+       SELECT count(*) FROM users;
+       \q            (quit)
+
+5. Check volumes:
+       docker volume ls
+   You'll see something like "tinyscale_pgdata"
+
+6. Check networks:
+       docker network ls
+   You'll see "tinyscale_tinyscale-network"
+
+7. Stop everything:
+       docker compose down          (stops and removes containers)
+       docker compose down -v       (also deletes volumes = deletes DB data)
+
+   IMPORTANT: `down` without -v keeps your data. With -v destroys it.
+
+
+================================================================================
+THINGS TO EXPERIMENT WITH (important for learning!)
+================================================================================
+
+1. LAYER CACHING:
+   - Change a line in src/server.ts (add a comment)
+   - Run `docker compose up --build` again
+   - Notice which steps say "CACHED" — only the COPY src/ and later rebuild
+   - Now change package.json (add a space in description)
+   - Run `docker compose up --build` again
+   - Notice npm ci runs again — because package.json layer changed!
+   - This is why we copy package.json BEFORE source code
+
+2. CONTAINER ISOLATION:
+   - Your app container can't see your host filesystem
+   - docker compose exec app ls /   (see the container's root filesystem)
+   - It's a completely separate filesystem from your Windows machine
+
+3. PERSISTENCE:
+   - Create a user via the API
+   - Run `docker compose down` (NOT -v)
+   - Run `docker compose up`
+   - The user should still exist! (data in volume)
+   - Now run `docker compose down -v` then `docker compose up --build`
+   - The user is gone. Volume was deleted.
+
+
+================================================================================
+CHECKLIST BEFORE MOVING TO DAY 3-4
+================================================================================
+
+[ ] Docker Desktop installed and running
+[ ] Understand the difference between containers and VMs
+[ ] Dockerfile written FROM SCRATCH (multi-stage build)
+[ ] .dockerignore created
+[ ] Docker image built successfully
+[ ] docker-compose.yml written with app + postgres
+[ ] Full app running in Docker (healthcheck responds)
+[ ] API tested through Docker (register, login, shorten)
+[ ] Explored running containers (exec, logs, ps)
+[ ] Understand: volumes (data persistence), networks (container communication)
+[ ] Understand: layer caching and why instruction order matters
+[ ] Experimented with rebuilds to see caching in action
+
+When all checkboxes are done, message me in chat: "Day 1-2 done, ready for Day 3-4"
+and I'll write the Nginx reverse proxy guide.
+
+================================================================================
+
+

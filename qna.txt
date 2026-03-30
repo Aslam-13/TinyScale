@@ -1,892 +1,1274 @@
-Q1: how did we miss envs? how to fix this? what is theusual process in prod to provide these
-
-$ docker run --rm -p 3000:3000 tinyscale:latest
-[dotenv@17.2.4] injecting env (0) from .env -- tip: 🗂️ backup and recover secrets: https://dotenvx.com/ops
-file:///app/dist/config/env.js:6
-        throw new Error(`Missing required environment variable: ${key}`);
-              ^
-
-Error: Missing required environment variable: DATABASE_URL
-    at requireEnv (file:///app/dist/config/env.js:6:15)
-    at file:///app/dist/config/env.js:11:19
-    at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
-    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:665:26)
-    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:117:5)
-
-Node.js v22.22.2
-
-
-A1: WHY IT HAPPENED
---------------------
-Your .dockerignore has `.env` in it (good! secrets should NOT be baked into images).
-So when Docker built the image, it skipped .env. No .env inside container = no env vars.
-
-The `dotenv` log even tells you: "injecting env (0) from .env" — it found 0 variables.
-
-HOW TO FIX (3 ways, from dev to prod):
-
-Method 1: Pass env vars directly with `docker run` (quick test)
-    docker run --rm -p 3000:3000 \
-      -e DATABASE_URL=postgres://dev:dev@host.docker.internal:5432/tinyscale \
-      -e JWT_SECRET=some-secret \
-      -e PORT=3000 \
-      -e HOST=0.0.0.0 \
-      tinyscale:latest
-
-    NOTE: `host.docker.internal` is a special Docker DNS name that points to
-    your HOST machine. Since Postgres is running on your machine (not in a
-    container), this is how the container reaches it.
-
-Method 2: Use an env file with docker run (better for dev)
-    Create a file called `.env.docker` (NOT .env — keep them separate):
-        DATABASE_URL=postgres://dev:dev@host.docker.internal:5432/tinyscale
-        JWT_SECRET=some-secret
-        PORT=3000
-        HOST=0.0.0.0
-
-    Then run:
-        docker run --rm -p 3000:3000 --env-file .env.docker tinyscale:latest
-
-Method 3: docker-compose (what we'll actually use — see STEP 7 in week2.txt)
-    The `environment:` block in docker-compose.yml injects env vars into the container.
-    This is why STEP 7 has those environment lines — Docker Compose handles it for you.
-
-HOW PROD DOES IT:
-    - Kubernetes: ConfigMaps (non-secret) + Secrets (sensitive) → injected as env vars into pods
-    - AWS ECS: Task Definition has environment variables, secrets from AWS Secrets Manager
-    - Docker Swarm: Docker secrets
-    - Cloud platforms (Railway, Fly.io): Dashboard/CLI to set env vars
-    - NEVER bake secrets into images. NEVER commit .env to git.
-    - The image is the SAME everywhere. Only env vars change between dev/staging/prod.
-
-    Think of it like this:
-        Image = your compiled code (same everywhere)
-        Env vars = configuration (different per environment)
-        This is called "12-factor app" methodology — config lives in the environment, not in code.
-
-
-Q2: why are we having two separate commands which are alomsot same but as builder and as Producction inside Docker file?
-
-A2: MULTI-STAGE BUILD — WHY TWO "FROM" BLOCKS
------------------------------------------------
-Look at what each stage needs:
-
-BUILDER stage (FROM node:22-alpine AS builder):
-    - npm ci           → installs ALL dependencies (including devDeps like typescript, vitest, tsx)
-    - npm run build    → compiles TypeScript to JavaScript
-    - After this, we have: node_modules (400MB+) with dev tools + dist/ folder with compiled JS
-    - We ONLY need the dist/ folder from here. Everything else is waste.
-
-PRODUCTION stage (FROM node:22-alpine AS production):
-    - npm ci --omit=dev → installs ONLY production dependencies (fastify, drizzle, etc.)
-    - COPY --from=builder /app/dist ./dist → grabs ONLY the compiled JS from builder
-    - No TypeScript compiler, no test runner, no build tools
-
-WHY NOT JUST ONE STAGE?
-    Single stage image would contain:
-        typescript (not needed at runtime)
-        vitest (not needed at runtime)
-        tsx (not needed at runtime)
-        all devDependencies
-        TypeScript source files (not needed, we run compiled JS)
-        Result: ~400-500MB image
-
-    Multi-stage image contains:
-        Only compiled JavaScript
-        Only production node_modules
-        Result: ~150-200MB image
-
-    Smaller image = faster deploy, faster pull, less attack surface (fewer packages = fewer vulnerabilities)
-
-ANALOGY:
-    Builder stage = your kitchen where you cook the meal (needs pots, knives, stove)
-    Production stage = the plate you serve to the customer (just the food)
-    You don't send the entire kitchen to the customer's table.
-
-TRY THIS to see the difference:
-    docker images
-    Look at the size of tinyscale:latest — that's the multi-stage result.
-
-    To see what single-stage would look like, temporarily change Dockerfile to:
-        FROM node:22-alpine
-        WORKDIR /app
-        COPY package.json package-lock.json ./
-        RUN npm ci
-        COPY tsconfig.json ./
-        COPY src/ ./src/
-        RUN npm run build
-        EXPOSE 3000
-        CMD ["node", "dist/server.js"]
-
-    Build it: docker build -t tinyscale:single .
-    Compare: docker images (check sizes of tinyscale:latest vs tinyscale:single)
-    Then REVERT your Dockerfile back to multi-stage. This was just for learning.
-
-
-Q3: along with Q1: lets also fix the postgres connection issue which we didn't get know but we will get i guess
-
-A3: THE POSTGRES CONNECTION PROBLEM
--------------------------------------
-You got the env var error FIRST, which masked the Postgres error. If you fix envs
-but run the container standalone (not with docker-compose), you'll hit this next:
-
-THE PROBLEM:
-    Your app inside the container tries to connect to Postgres.
-    But Postgres is running on your HOST machine, not inside the container.
-    Container's "localhost" = the container itself (nothing there).
-    Container's "localhost" ≠ your Windows machine.
-
-    Container world:
-    ┌─────────────────────┐     ┌─────────────────────┐
-    │   app container     │     │   your Windows PC    │
-    │   localhost = self  │  X  │   localhost:5432     │
-    │   no Postgres here! │     │   Postgres is HERE   │
-    └─────────────────────┘     └─────────────────────┘
-    They can't see each other by default!
-
-FIX FOR STANDALONE docker run (Method 1 from A1):
-    Use `host.docker.internal` instead of `localhost` in DATABASE_URL:
-        DATABASE_URL=postgres://dev:dev@host.docker.internal:5432/tinyscale
-
-    `host.docker.internal` is Docker's special hostname that resolves to your host machine.
-
-FIX FOR docker-compose (what we'll actually use):
-    In docker-compose.yml, Postgres runs as ANOTHER container called `db`.
-    Your app's DATABASE_URL uses `db` as the hostname:
-        DATABASE_URL=postgres://dev:dev@db:5432/tinyscale
-
-    Docker Compose creates a network. Both containers join it.
-    Docker's internal DNS resolves "db" → Postgres container's IP address.
-
-    docker-compose world:
-    ┌──────────── tinyscale-network ────────────┐
-    │                                            │
-    │  ┌─────────────┐     ┌─────────────┐      │
-    │  │ app          │────→│ db           │     │
-    │  │ connects to  │     │ (postgres)   │     │
-    │  │ db:5432      │     │ port 5432    │     │
-    │  └─────────────┘     └─────────────┘      │
-    │                                            │
-    └────────────────────────────────────────────┘
-    Same network = they find each other by service name.
-
-SUMMARY OF BOTH FIXES:
-    1. Standalone: use -e flags + host.docker.internal for DB host
-    2. docker-compose: environment block handles env vars + "db" hostname resolves via Docker DNS
-    3. You should now proceed to STEP 7 (docker-compose.yml) — that's the real fix for both problems.
-
-NEXT STEP: Write your docker-compose.yml (STEP 7 in week2.txt) and run:
-    docker compose up --build
-    This handles BOTH the env vars AND the Postgres connection automatically.
-
-    
-
-Q4: now did we remove the concept of multi stage inside docker compose as i don't see it i guess those issues which were multi stage solving the same issue still isnide compose no?
-
-A4: NO — MULTI-STAGE IS STILL THERE. COMPOSE DIDN'T REPLACE IT.
------------------------------------------------------------------
-They work TOGETHER, not instead of each other.
-
-    Dockerfile = HOW to build ONE image (multi-stage lives here)
-    docker-compose.yml = HOW to run MULTIPLE containers together
-
-When docker-compose says:
-    app:
-      build:
-        context: .
-        dockerfile: Dockerfile
-
-It literally runs your Dockerfile to build the image. The multi-stage build
-still happens — builder stage compiles TS, production stage gets only the
-compiled JS. Compose just USES the final image that Dockerfile produces.
-
-Think of it:
-    Dockerfile   → recipe for cooking ONE dish (your app)
-    Compose      → the dinner plan (app + database + network, all on the table)
-
-The recipe doesn't change just because you're now serving a full dinner.
-
-PROOF: Run `docker compose up --build` and watch the logs.
-You'll see "[builder]" and "[production]" stages in the build output.
-
-
-Q5: so the difference between Dockerfile and a compose fiel is jsut ath compose composes more than one container right? and also their network connectiosn?
-
-A5: YES, BUT LET'S BE PRECISE
--------------------------------
-Dockerfile:
-    - Builds ONE image from scratch
-    - Defines: what base OS, what files to copy, what to install, what command to run
-    - Output: a single image (e.g., tinyscale:latest)
-
-docker-compose.yml:
-    - Orchestrates MULTIPLE containers that work together
-    - Defines: which containers to run, their env vars, networks, volumes, ports, startup order
-    - Uses: images (either from Dockerfile or pre-built like postgres:16-alpine)
-
-What compose adds beyond "multiple containers":
-    1. Networking     → containers find each other by name (app calls "db", not an IP)
-    2. Volumes        → persistent storage that survives container restarts
-    3. Dependencies   → "start db before app" (depends_on + healthcheck)
-    4. Environment     → inject env vars without baking them into the image
-    5. Port mapping   → which host ports map to which container ports
-    6. Restart policy → auto-restart crashed containers
-
-WITHOUT compose, you'd have to do ALL of this manually:
-    docker network create tinyscale-net
-    docker volume create pgdata
-    docker run -d --name db --network tinyscale-net -v pgdata:/var/lib/postgresql/data postgres:16-alpine
-    docker build -t tinyscale .
-    docker run -d --name app --network tinyscale-net -p 3000:3000 -e DATABASE_URL=... tinyscale
-
-    That's painful. Compose does it all with: docker compose up
-
-
-Q6: volumes:
-      - pgdata:/var/lib/postgresql/data
-      # Named volume = data persists even if container is destroyed
-      # /var/lib/postgresql/data is where Postgres stores its files INSIDE the container
-
-      how does it store it if the conatiner crashers doens't that means that db container itself restrrts t and the postgres has to somehow recover that data if i assume that we save inside the machine which i am using then it makes sesne if we are saving inside container itself (even it turns my own machne drive but it removes all of theat as soon as container is removed or terminates right? ) i guess we are facing these issue because we don't have a real separate w and we are using just my machine we wont' see this in prod
-
-A6: YOUR GUESS IS CORRECT — VOLUMES STORE DATA ON YOUR HOST MACHINE, NOT INSIDE THE CONTAINER
------------------------------------------------------------------------------------------------
-
-Here's exactly what happens:
-
-WITHOUT a volume:
-    Container has its own filesystem (layered, ephemeral).
-    Postgres writes data to /var/lib/postgresql/data INSIDE the container.
-    Container dies → filesystem is gone → ALL DATA LOST.
-
-WITH a named volume (pgdata:/var/lib/postgresql/data):
-    Docker creates a folder ON YOUR HOST MACHINE (your Windows drive).
-    It MOUNTS that folder into the container at /var/lib/postgresql/data.
-    Postgres THINKS it's writing inside the container, but actually
-    the writes go to your host machine's disk.
-
-    Container dies → container filesystem is gone → BUT the volume folder
-    on your host is untouched → new container starts → mounts same volume
-    → data is still there!
-
-WHERE IS IT ON YOUR MACHINE?
-    Run: docker volume inspect tinyscale_pgdata
-    You'll see "Mountpoint": something like /var/lib/docker/volumes/tinyscale_pgdata/_data
-    (On Windows with WSL2, this is inside the WSL2 VM's virtual disk)
-
-VISUAL:
-    ┌─── Your Windows Machine (host) ──────────────────────┐
-    │                                                       │
-    │   Docker volume: tinyscale_pgdata                     │
-    │   (actual files on disk, survives everything)         │
-    │       ↕ mounted                                       │
-    │   ┌─── db container ──────────────────┐               │
-    │   │  /var/lib/postgresql/data  ←──────── same files   │
-    │   │  Postgres reads/writes here       │               │
-    │   └───────────────────────────────────┘               │
-    │                                                       │
-    └───────────────────────────────────────────────────────┘
-
-WHAT ABOUT `docker compose down -v`?
-    `down`    → removes containers, keeps volumes → data survives
-    `down -v` → removes containers AND volumes → data DELETED
-
-NOW YOUR PROD QUESTION — "we won't see this in prod":
-    Actually, you WILL see volumes in prod too, but differently:
-
-    - Local dev: volume = folder on your machine's disk
-    - Prod (Kubernetes): PersistentVolumeClaim → backed by cloud storage (AWS EBS, GCP Persistent Disk)
-    - Prod (AWS RDS): You don't even run Postgres in a container — AWS manages the disk entirely
-    - Prod (Docker on a server): same named volumes, but on the server's disk
-
-    The CONCEPT is identical everywhere: database storage must outlive the container/pod.
-    Only the BACKEND changes (local disk vs cloud disk vs managed service).
-
-
-Q7: read step 8 from week2.txt as it is saying that we need migration shich depednds on drizzle-kit but it is not there in prod or compoise file then hwo i am usppose to add it -> it doesn give me steps to add it andd also wehre should i add that pice of command for migration which wee2.txt has given
-
-A7: HOW THE MIGRATION SERVICE WORKS + EXACTLY WHERE TO ADD IT
----------------------------------------------------------------
-
-THE PROBLEM:
-    Your production image doesn't have drizzle-kit (it's a devDependency, stripped by --omit=dev).
-    But you need drizzle-kit to run migrations (create tables in the database).
-
-THE TRICK: Use `target: builder` in compose.
-    Remember your Dockerfile has two stages: builder and production.
-    The builder stage HAS all devDependencies (including drizzle-kit).
-    You can tell compose: "for THIS service, use the builder stage, not production."
-
-EXACTLY WHAT TO DO:
-
-Open your docker-compose.yml and add the `migrate` service BETWEEN the `app` and `db` services.
-Your docker-compose.yml should look like this:
-
-    services:
-      app:
-        build:
-          context: .
-          dockerfile: Dockerfile
-        ports:
-          - "3000:3000"
-        environment:
-          DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
-          JWT_SECRET: docker-dev-secret-change-in-production
-          PORT: 3000
-          HOST: 0.0.0.0
-          NODE_ENV: production
-        depends_on:
-          db:
-            condition: service_healthy
-          migrate:
-            condition: service_completed_successfully
-        networks:
-          - tinyscale-network
-        restart: unless-stopped
-
-      migrate:
-        build:
-          context: .
-          dockerfile: Dockerfile
-          target: builder
-        command: ["npx", "drizzle-kit", "push"]
-        environment:
-          DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
-        depends_on:
-          db:
-            condition: service_healthy
-        networks:
-          - tinyscale-network
-
-      db:
-        image: postgres:16-alpine
-        environment:
-          POSTGRES_USER: dev
-          POSTGRES_PASSWORD: dev
-          POSTGRES_DB: tinyscale
-        ports:
-          - "5433:5432"
-        volumes:
-          - pgdata:/var/lib/postgresql/data
-        healthcheck:
-          test: ["CMD-SHELL", "pg_isready -U dev -d tinyscale"]
-          interval: 5s
-          timeout: 5s
-          retries: 5
-        networks:
-          - tinyscale-network
-
-    volumes:
-      pgdata:
-
-    networks:
-      tinyscale-network:
-        driver: bridge
-
-KEY THINGS TO NOTICE:
-
-1. `target: builder` → tells compose to stop at the builder stage of Dockerfile.
-   This image HAS drizzle-kit because builder runs `npm ci` (all deps, including dev).
-
-2. `command: ["npx", "drizzle-kit", "push"]` → overrides the Dockerfile's CMD.
-   Instead of starting the server, it runs the migration.
-
-3. `condition: service_completed_successfully` on the app's depends_on for migrate →
-   app waits until migration FINISHES (not just starts) before starting.
-
-4. The migrate container runs ONCE, does the migration, then exits. It doesn't stay running.
-
-STARTUP ORDER:
-    db starts → healthcheck passes → migrate runs drizzle-kit push → tables created → migrate exits → app starts
-    This guarantees your app always has the correct database schema.
-
-
-Q8: now do we need separate new image as we have moved from Dockerfile to compose and also added few other things no? in sohosr tem l me
-
-A8: NO — YOU DON'T NEED A NEW IMAGE. COMPOSE BUILDS IT FROM YOUR EXISTING DOCKERFILE.
----------------------------------------------------------------------------------------
-
-When you run: docker compose up --build
-
-Here's what happens:
-
-1. Compose reads docker-compose.yml
-2. It sees THREE services: app, migrate, db
-
-3. For `db`:
-   - `image: postgres:16-alpine` → pulls pre-built image from Docker Hub. No build needed.
-
-4. For `app`:
-   - `build: context: . dockerfile: Dockerfile` → runs your Dockerfile
-   - No `target:` specified → builds ALL stages → uses the FINAL stage (production)
-   - Result: your multi-stage image with only compiled JS + prod deps
-
-5. For `migrate`:
-   - `build: context: . dockerfile: Dockerfile target: builder` → runs your SAME Dockerfile
-   - `target: builder` → STOPS at the builder stage (doesn't go to production stage)
-   - Result: image with ALL deps including drizzle-kit
-
-IMPORTANT: Steps 4 and 5 use the SAME Dockerfile. No new Dockerfile needed.
-Docker is smart enough to cache shared layers — it doesn't build from scratch twice.
-
-    Same Dockerfile, two services:
-    ┌──────────────────────────────────────┐
-    │         YOUR DOCKERFILE              │
-    │                                      │
-    │  ┌── builder stage ──────────┐       │
-    │  │  npm ci (all deps)        │ ←── migrate service stops here (target: builder)
-    │  │  npm run build            │       │
-    │  └───────────────────────────┘       │
-    │           ↓                           │
-    │  ┌── production stage ───────┐       │
-    │  │  npm ci --omit=dev        │ ←── app service uses this (final stage)
-    │  │  COPY --from=builder dist │       │
-    │  └───────────────────────────┘       │
-    └──────────────────────────────────────┘
-
-SO TO SUMMARIZE YOUR NEXT STEPS:
-    1. You already have the Dockerfile (no changes needed)
-    2. Update docker-compose.yml to include the migrate service (see A7 above)
-    3. Run: docker compose up --build
-    4. Watch the logs — you should see db start, migrate run, then app start
-    5. Test: curl http://localhost:3000/healthcheck
-
-
-    Q9: i have oncfustion Dockerfile is to build image good?
- then docker compose uses those Dockerfile to manage multiple continaers good? it does create image or doesn't contian commands to create images?
- then why we don'thave Dockerfile seaprate for our postgres? and why we are no hainvt multi stage for psotgres as well? and even though now we are srunning two separate containers one for actual app and one for db?
- i am trying to udnerstand that can we get remove the Dockerfile alotogether?
-
-A9:
+Q1: please write nignx.conf file foor me from week2_rest files
+
+A1: No. Type it yourself. That's the whole point of the guide saying "TYPE EVERY LINE."
+    The full nginx.conf is in week2_rest.txt Step 1 (lines 73-310).
+    Open that file, read each section, and type it into nginx/nginx.conf.
+    If you copy-paste, you'll forget it in a week. If you type it, you'll remember why
+    each line exists.
+
+    Quick reference — the sections you need to type:
+        1. worker_processes + events block
+        2. http block with: MIME types, log format, sendfile, keepalive
+        3. gzip settings (6 lines)
+        4. rate limiting zones (2 limit_req_zone lines)
+        5. upstream block (points to app:3000)
+        6. server block for port 80 (security headers + proxy locations)
+        7. server block for port 443 (SSL + same locations)
+
+    Start typing. If you get stuck on a specific section, ask about THAT section.
+
+
+Q2: i thought SSL is needed for the web frontend domains didn't know backend alsoneeds them i understand TLS handshake which where both of them trust each other and pass data i guess this SSL certificatio which is needed to backend
+
+A2: GOOD QUESTION — LET'S CLEAR THIS UP
+-----------------------------------------
+SSL/TLS is NOT about "frontend vs backend." It's about ENCRYPTING THE CONNECTION
+between ANY two points that talk over a network.
+
+WHERE SSL LIVES IN OUR SETUP:
+
+    User (browser) ──── HTTPS (encrypted) ────→ Nginx ──── HTTP (plain) ────→ App:3000
+
+    SSL is between the USER and NGINX. Not between Nginx and your app.
+    This is called "SSL TERMINATION" — Nginx handles the encryption/decryption.
+    Your app talks plain HTTP to Nginx (they're on the same Docker network, so it's safe).
+
+WHY NOT JUST ON FRONTEND?
+    Think about it: your frontend makes API calls to the backend.
+
+    Without SSL on backend:
+        Browser ──── HTTPS ────→ Frontend (React)
+        Frontend ──── HTTP (plain text!) ────→ Backend API
+        Anyone on the network can read: passwords, tokens, user data
+
+    With SSL on backend (what we're doing):
+        Browser ──── HTTPS ────→ Nginx (terminates SSL)
+        Nginx ──── HTTP ────→ App (same private network, safe)
+
+    In our case, Nginx IS the entry point for both frontend and backend.
+    There's no separate frontend server — it's all one Nginx.
+
+REAL PROD SCENARIOS:
+
+    Scenario 1: API-only backend (like TinyScale)
+        User → HTTPS → Nginx/Load Balancer (SSL termination) → HTTP → App
+        SSL cert is on Nginx. App doesn't know about SSL.
+
+    Scenario 2: Frontend + Backend separate
+        User → HTTPS → CDN (serves React) → HTTPS → API Gateway → HTTP → Backend
+        SSL cert is on the CDN and API Gateway. Backend doesn't handle SSL.
+
+    Scenario 3: Microservices talking to each other (mTLS)
+        Service A → HTTPS → Service B (both have certs, both verify each other)
+        This is called mutual TLS — used in zero-trust networks (K8s service mesh).
+
+BOTTOM LINE:
+    - SSL protects data IN TRANSIT (on the network)
+    - Anything that faces the internet needs SSL (frontend OR backend)
+    - Internal services (behind a firewall/private network) often use plain HTTP
+    - Our Nginx handles SSL so our app doesn't have to
+    - The self-signed cert is for learning. Prod uses Let's Encrypt (free, trusted).
+
+
+Q3: how to reload niginx now keeping the containers as it is? if i had to just restart the nginx i have to cancel the terminal wehre i ran docekr up build command which is terminating the containers as welln ono?
+
+A3: THREE WAYS — you do NOT need to cancel the terminal or stop other containers.
+
+Method 1: Reload Nginx config WITHOUT restarting (best — zero downtime):
+    Open a SECOND terminal. Run:
+        docker compose exec nginx nginx -s reload
+
+    This tells the running Nginx process to re-read its config file.
+    No restart, no downtime, other containers untouched.
+
+Method 2: Restart ONLY the nginx container:
+    docker compose restart nginx
+
+    This stops and starts only the nginx container. App and db keep running.
+    There's a brief moment (~1 second) where Nginx is down.
+
+Method 3: Run everything in the background (so your terminal is free):
+    Next time, start with:
+        docker compose up --build -d
+
+    -d = detached mode. Containers run in background. Your terminal is free.
+    Then use:
+        docker compose logs -f          (follow all logs)
+        docker compose logs -f nginx    (follow just nginx logs)
+
+    To stop later:
+        docker compose down
+
+IMPORTANT: Ctrl+C in the attached terminal does `docker compose stop` —
+it stops ALL containers. That's why -d is better for development.
+Run in background, use logs when you need them.
+
+
+Q4: so nginx itself is a container means everything goes an come to and from server goes though ngixn container first?
+
+A4: YES — exactly.
+-------------------
+    User request → port 80/443 on your machine → Nginx container → App container → DB container
+    Response     → DB container → App container → Nginx container → port 80/443 → User
+
+    Nginx is the ONLY container with ports exposed to the outside world.
+    App and DB are hidden — only reachable through the Docker network.
+
+    ┌─── Your Machine (host) ────────────────────────────────┐
+    │                                                         │
+    │  port 80 ──→ ┌──────────────────────────────────────┐   │
+    │  port 443 ─→ │  tinyscale-network (Docker internal)  │  │
+    │              │                                        │  │
+    │              │  nginx:80/443 → app:3000 → db:5432    │  │
+    │              │  (exposed)      (hidden)   (hidden)    │  │
+    │              └──────────────────────────────────────┘   │
+    │                                                         │
+    │  port 5433 ──→ db:5432 (only for YOUR local dev access) │
+    └─────────────────────────────────────────────────────────┘
+
+    The db port 5433 mapping is the only exception — we kept it so YOU can
+    connect from your machine (pgAdmin, psql) for debugging. In prod,
+    even that would be removed.
+
+Q5: 
+
+C:\three-month-real-engg\TinyScale>k6 run load-tests/basic.js
+
+         /\      Grafana   /‾‾/
+    /\  /  \     |\  __   /  /
+   /  \/    \    | |/ /  /   ‾‾\
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/
+
+
+     execution: local
+        script: load-tests/basic.js
+        output: -
+
+     scenarios: (100.00%) 1 scenario, 100 max VUs, 4m0s max duration (incl. graceful stop):
+              * default: Up to 100 looping VUs for 3m30s over 5 stages (gracefulRampDown: 30s, gracefulStop: 30s)
+
+INFO[0003] Setup complete. Token obtained. 0 short URLs created.  source=console
+
+
+  █ THRESHOLDS
+
+    errors
+    ✗ 'rate<0.1' rate=100.00%
+
+    http_req_duration
+    ✓ 'p(95)<500' p(95)=8.71ms
+
+
+  █ TOTAL RESULTS
+
+    checks_total.......: 5328    24.924396/s
+    checks_succeeded...: 0.00%   0 out of 5328
+    checks_failed......: 100.00% 5328 out of 5328
+
+    ✗ shorten: status 201
+      ↳  0% — ✓ 0 / ✗ 2664
+    ✗ shorten: has shortCode
+      ↳  0% — ✓ 0 / ✗ 2664
+
+    CUSTOM
+    errors.........................: 100.00% 2664 out of 2664
+
+    HTTP
+    http_req_duration..............: avg=6.14ms min=1.42ms   med=4.5ms    max=2.48s p(90)=6.87ms p(95)=8.71ms
+      { expected_response:true }...: avg=2.48s  min=2.48s    med=2.48s    max=2.48s p(90)=2.48s  p(95)=2.48s
+    http_req_failed................: 99.96%  2675 out of 2676
+    http_reqs......................: 2676    12.518334/s
+
+    EXECUTION
+    iteration_duration.............: avg=1s     min=500.34ms med=998.84ms max=1.56s p(90)=1.4s   p(95)=1.45s
+    iterations.....................: 13546   63.368217/s
+    vus............................: 3       min=0            max=100
+    vus_max........................: 100     min=100          max=100
+
+    NETWORK
+    data_received..................: 1.2 MB  5.7 kB/s
+    data_sent......................: 611 kB  2.9 kB/s
+
+
+
+
+running (3m33.8s), 000/100 VUs, 13546 complete and 0 interrupted iterations
+default ✓ [======================================] 000/100 VUs  3m30s
+ERRO[0214] thresholds on metrics 'errors' have been crossed
+
+- a lot of requests from docker compose logs nginx 2>&1 | grep "limiting" is like this:
+nginx-1  | 2026/03/30 07:11:56 [error] 78#78: *59 limiting requests, excess: 20.640 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:56 [error] 80#80: *87 limiting requests, excess: 20.640 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:56 [error] 78#78: *61 limiting requests, excess: 20.150 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:56 [error] 77#77: *48 limiting requests, excess: 20.710 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:56 [error] 82#82: *119 limiting requests, excess: 20.100 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:56 [error] 78#78: *60 limiting requests, excess: 20.340 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:57 [error] 80#80: *101 limiting requests, excess: 20.270 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:59 [error] 77#77: *46 limiting requests, excess: 20.600 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:59 [error] 80#80: *101 limiting requests, excess: 20.290 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:59 [error] 81#81: *20 limiting requests, excess: 20.120 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:59 [error] 86#86: *30 limiting requests, excess: 20.460 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:00 [error] 80#80: *93 limiting requests, excess: 20.270 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:02 [error] 78#78: *63 limiting requests, excess: 20.190 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:03 [error] 77#77: *43 limiting requests, excess: 20.080 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:05 [error] 77#77: *49 limiting requests, excess: 20.370 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:06 [error] 82#82: *22 limiting requests, excess: 20.500 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+
+
+- stats look good:
+CONTAINER ID   NAME                CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O   PIDS
+906edbbcf096   tinyscale-nginx-1   0.00%     11.54MiB / 3.557GiB   0.32%     1.81MB / 2.27MB   0B / 0B     13
+81a4a502729a   tinyscale-app-1     0.00%     31.22MiB / 3.557GiB   0.86%     836kB / 807kB     0B / 0B     11
+34473652d865   tinyscale-db-1      11.25%    24.83MiB / 3.557GiB   0.68%     30.9kB / 17.7kB   0B / 0B     6
+
+we have to complete step 4 and 5 in week2_rest.txt
+
+A5: READING YOUR RESULTS — WHAT HAPPENED AND WHAT TO DO
+---------------------------------------------------------
+
+PROBLEM 1: "0 short URLs created" in setup
+    Look at line 151: "Setup complete. Token obtained. 0 short URLs created."
+    The setup registered + logged in successfully (got a token ✓).
+    But creating short URLs FAILED — all 10 attempts returned errors.
+
+    WHY? The setup function also hits /api/shorten through Nginx.
+    Rate limit is 10r/s with burst=20. Setup fires 10 rapid requests +
+    the register + login = 12 requests in ~1 second. Some got rate-limited.
+
+    Also: the setup runs register and login with DIFFERENT timestamps
+    (Date.now() is called twice, milliseconds apart), so the login email
+    doesn't match the register email. That's a bug in the test script.
+
+PROBLEM 2: 100% error rate — all checks failed
+    Since 0 short URLs were created, shortCodes array is empty.
+    The redirect scenario (70% of traffic) is skipped (shortCodes.length > 0 check).
+    Only the shorten scenario (20%) runs — but ALL return 503 (rate limited by Nginx).
+    The test expects status 201, gets 503 → every check fails.
+
+PROBLEM 3: Nginx rate limiting is the bottleneck
+    Your logs confirm it: "limiting requests, excess: 20.640 by zone api"
+    All 100 virtual users come from the SAME IP (172.18.0.1 = your machine).
+    Rate limit is per IP: 10r/s + burst 20. With 100 users from one IP,
+    you blow past the limit instantly.
+
+    This is EXPECTED in load testing. In real prod, users come from different IPs.
+    For load testing, you need to relax the rate limits.
+
+WHAT THE DOCKER STATS TELL YOU:
+    App CPU: 0.00% — your app barely did any work (Nginx blocked everything)
+    DB CPU: 11.25% — only a few requests made it through
+    Nginx CPU: 0.00% — rate limiting is cheap, Nginx barely breaks a sweat
+    Memory: all low — no memory issues
+
+    CONCLUSION: You didn't actually stress-test your app. You stress-tested
+    Nginx's rate limiter. Which worked perfectly! But that's not the goal.
+
+HOW TO FIX AND RE-RUN:
+
+Step 1: Fix the test script setup (the Date.now() bug).
+    Open load-tests/basic.js. In the setup() function, change this:
+
+        const registerRes = http.post(
+            `${BASE_URL}/api/auth/register`,
+            JSON.stringify({
+                email: `loadtest-${Date.now()}@test.com`,
+                password: 'test1234',
+            }),
+            { headers: { 'Content-Type': 'application/json' } }
+        );
+
+        const loginRes = http.post(
+            `${BASE_URL}/api/auth/login`,
+            JSON.stringify({
+                email: `loadtest-${Date.now()}@test.com`,    // ← BUG: different timestamp!
+                password: 'test1234',
+            }),
+            { headers: { 'Content-Type': 'application/json' } }
+        );
+
+    To this (save the email in a variable):
+
+        const email = `loadtest-${Date.now()}@test.com`;
+
+        const registerRes = http.post(
+            `${BASE_URL}/api/auth/register`,
+            JSON.stringify({ email, password: 'test1234' }),
+            { headers: { 'Content-Type': 'application/json' } }
+        );
+
+        const loginRes = http.post(
+            `${BASE_URL}/api/auth/login`,
+            JSON.stringify({ email, password: 'test1234' }),
+            { headers: { 'Content-Type': 'application/json' } }
+        );
+
+Step 2: Temporarily increase Nginx rate limits for load testing.
+    Open nginx/nginx.conf and change:
+
+        limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+        limit_req_zone $binary_remote_addr zone=login:10m rate=3r/s;
+
+    To:
+
+        limit_req_zone $binary_remote_addr zone=api:10m rate=500r/s;
+        limit_req_zone $binary_remote_addr zone=login:10m rate=50r/s;
+
+    And change burst values in the location blocks:
+
+        limit_req zone=api burst=20 nodelay;     → limit_req zone=api burst=200 nodelay;
+        limit_req zone=login burst=5 nodelay;    → limit_req zone=login burst=50 nodelay;
+
+    (Change ALL occurrences — both in port 80 and port 443 server blocks)
+
+Step 3: Reload Nginx (no rebuild needed):
+    docker compose exec nginx nginx -s reload
+
+Step 4: Re-run the load test:
+    k6 run load-tests/basic.js
+
+Step 5: Watch docker stats in another terminal while it runs:
+    docker stats
+
+    THIS TIME you should see:
+    - Short URLs being created in setup
+    - Redirects and stats checks running
+    - App CPU going up (actual load!)
+    - DB CPU going up (actual queries!)
+
+Step 6: After the test, REVERT nginx.conf rate limits back to production values.
+    Don't leave 500r/s in there — that defeats the purpose of rate limiting.
+
+    Change back to:
+        rate=10r/s, burst=20 (api)
+        rate=3r/s, burst=5 (login)
+
+    Then: docker compose exec nginx nginx -s reload
+
+LESSON LEARNED:
+    Rate limiting WORKS. It protected your app from 100 concurrent users
+    from a single IP. That's exactly what it should do in production.
+    But for load testing, you need to relax it temporarily so you can
+    actually find the REAL bottleneck (app CPU? DB connections? memory?).
+
+Q6: 
+
+
+C:\three-month-real-engg\TinyScale>k6 run load-tests/basic.js
+
+         /\      Grafana   /‾‾/
+    /\  /  \     |\  __   /  /
+   /  \/    \    | |/ /  /   ‾‾\
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/
+
+
+     execution: local
+        script: load-tests/basic.js
+        output: -
+
+     scenarios: (100.00%) 1 scenario, 100 max VUs, 4m0s max duration (incl. graceful stop):
+              * default: Up to 100 looping VUs for 3m30s over 5 stages (gracefulRampDown: 30s, gracefulStop: 30s)
+
+INFO[0002] Setup complete. Token obtained. 10 short URLs created.  source=console
+
+
+  █ THRESHOLDS
+
+    errors
+    ✗ 'rate<0.1' rate=97.11%
+
+    http_req_duration
+    ✓ 'p(95)<500' p(95)=12.19ms
+
+
+  █ TOTAL RESULTS
+
+    checks_total.......: 25569  119.91515/s
+    checks_succeeded...: 2.89%  741 out of 25569
+    checks_failed......: 97.10% 24828 out of 25569
+
+    ✗ redirect: status 302
+      ↳  2% — ✓ 263 / ✗ 9161
+    ✗ redirect: has Location
+      ↳  2% — ✓ 263 / ✗ 9161
+    ✗ stats: status 200
+      ↳  2% — ✓ 35 / ✗ 1328
+    ✗ shorten: status 201
+      ↳  3% — ✓ 90 / ✗ 2589
+    ✗ shorten: has shortCode
+      ↳  3% — ✓ 90 / ✗ 2589
+
+    CUSTOM
+    errors.........................: 97.11% 13078 out of 13466
+    redirect_duration..............: avg=6.466866 min=2.1427   med=4.94255  max=425.3821 p(90)=8.07395 p(95)=11.426375
+
+    HTTP
+    http_req_duration..............: avg=6.83ms   min=2.14ms   med=4.97ms   max=1.5s     p(90)=8.45ms  p(95)=12.19ms
+      { expected_response:true }...: avg=36.79ms  min=5.26ms   med=13.11ms  max=1.5s     p(90)=57.79ms p(95)=117.04ms
+    http_req_failed................: 97.03% 13078 out of 13478
+    http_reqs......................: 13478  63.209996/s
+
+    EXECUTION
+    iteration_duration.............: avg=1s       min=500.34ms med=997.88ms max=1.62s    p(90)=1.4s    p(95)=1.45s
+    iterations.....................: 13511  63.364762/s
+    vus............................: 2      min=0              max=100
+    vus_max........................: 100    min=100            max=100
+
+    NETWORK
+    data_received..................: 6.0 MB 28 kB/s
+    data_sent......................: 2.2 MB 10 kB/s
+
+
+
+
+running (3m33.2s), 000/100 VUs, 13511 complete and 0 interrupted iterations
+default ✓ [======================================] 000/100 VUs  3m30s
+ERRO[0215] thresholds on metrics 'errors' have been crossed
+
+
+TBH, i don't understand what the load testing is doing? like what and hwo it is teting is it randomaly hitting app with hundreds of requests or waht and where are we failing?
+
+teh app CPU peaked at arong 8% that is it 
+
+nginx-1  | 2026/03/30 07:11:59 [error] 80#80: *101 limiting requests, excess: 20.290 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:59 [error] 81#81: *20 limiting requests, excess: 20.120 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:11:59 [error] 86#86: *30 limiting requests, excess: 20.460 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:00 [error] 80#80: *93 limiting requests, excess: 20.270 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:02 [error] 78#78: *63 limiting requests, excess: 20.190 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:03 [error] 77#77: *43 limiting requests, excess: 20.080 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:05 [error] 77#77: *49 limiting requests, excess: 20.370 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost"
+nginx-1  | 2026/03/30 07:12:06 [error] 82#82: *22 limiting requests, excess: 20.500 by zone "api", client: 172.18.0.1, server: localhost, request: "POST /api/shorten HTTP/1.1", host: "localhost" 
+
+still i esee a lof requests like this like specific to this whatis happening?
+ehwhat is goind on?
+
+A6:
 ----
-Two ways to get an image:
-    1. BUILD it yourself → you write a Dockerfile (your app — custom code, custom setup)
-    2. USE a pre-built one → someone already built it, it's on Docker Hub (postgres, redis, nginx)
 
-Why no Dockerfile for Postgres?
-    The Postgres team already built the image for you: `postgres:16-alpine`
-    It has Postgres installed, configured, and ready to run.
-    You just pull it and pass env vars (POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB).
-    Writing a Dockerfile for Postgres would be like rewriting npm — pointless, they did it better.
+FIRST — WHAT IS LOAD TESTING ACTUALLY DOING? (since you asked)
+================================================================
 
-Why no multi-stage for Postgres?
-    Multi-stage exists to separate BUILD tools from RUNTIME.
-    Your app needs this: TypeScript compiler (build) vs compiled JS (runtime).
-    Postgres has nothing to compile. It's a ready-to-run binary. No build step needed.
+Think of it like this. Your app is a restaurant.
+    - 1 customer at a time? Easy. Chef handles it.
+    - 10 customers? Fine, maybe slightly slower.
+    - 100 customers walk in at the same time? Kitchen breaks.
 
-Can you remove the Dockerfile altogether?
-    Only if you also push your image to a registry (like Docker Hub).
-    Then compose would say `image: your-username/tinyscale:latest` instead of `build: .`
-    But you'd still need the Dockerfile to BUILD that image in the first place.
-    So no — you can't eliminate it. You can only move WHERE it gets built (locally vs CI/CD).
+k6 simulates those 100 customers. Here's exactly what happens:
 
-SUMMARY:
-    ┌──────────────┬─────────────────────┬──────────────────────┐
-    │ Service      │ Image source        │ Dockerfile needed?   │
-    ├──────────────┼─────────────────────┼──────────────────────┤
-    │ app          │ build: . (custom)   │ YES — your code      │
-    │ migrate      │ build: . (custom)   │ YES — same one       │
-    │ db (postgres)│ image: postgres:16  │ NO — pre-built       │
-    └──────────────┴─────────────────────┴──────────────────────┘
+    Time 0:00-0:30 → k6 gradually creates 0→50 "virtual users" (VUs)
+    Time 0:30-1:30 → 50 VUs all running simultaneously
+    Time 1:30-2:00 → ramps up to 100 VUs
+    Time 2:00-3:00 → 100 VUs all running simultaneously
+    Time 3:00-3:30 → ramps back down to 0
 
-    You write Dockerfiles for YOUR code. You use pre-built images for standard tools.
+    Each VU runs the default function in a loop:
+        1. Roll a dice:
+           - 20% chance → POST /api/shorten (create a short URL)
+           - 70% chance → GET /{code} (click a short URL, expect 302 redirect)
+           - 10% chance → GET /api/stats/{code} (get analytics)
+        2. Check: did I get the expected response? (201, 302, 200)
+        3. If not → count as error
+        4. Sleep 0.5-1.5 seconds (simulate human think time)
+        5. Loop again
+
+    With 100 VUs, each doing ~1 request/second → ~63 requests/second hitting your server.
+    That's what http_reqs rate shows: 63.2/s.
 
 
-    Q10: suppose in rel prod system we have few micro systems like different container so w do we need one single file fro all of them which is Dockerfile or separate for each system and same for ocmpose?
+NOW — WHY 97% ERRORS?
+========================
 
-A10:
------
-Dockerfile: ONE PER SERVICE (if it's custom code)
-    Each microservice has its own Dockerfile in its own repo/folder.
+Your results:  "10 short URLs created" ✓ — setup worked!
+But checks:    97% failed. Only 2-3% of requests succeeded.
 
-    Example real prod layout:
-        user-service/
-            Dockerfile        ← builds user-service image
-            src/
-        order-service/
-            Dockerfile        ← builds order-service image
-            src/
-        notification-service/
-            Dockerfile        ← builds notification-service image
-            src/
+Look at your Nginx logs carefully:
+    "limiting requests, excess: 20.640 by zone api"
+    "limiting requests, excess: 20.290 by zone api"
+    "limiting requests, excess: 20.150 by zone api"
 
-    Why? Each service has different dependencies, different base images,
-    different build steps. A Go service and a Node service can't share a Dockerfile.
+See that number "20.xxx"? That's the BURST being exceeded.
+burst=20 means Nginx allows 20 requests to queue up. Once exceeded → 503 reject.
 
-docker-compose: Usually ONE for local dev, ZERO in real prod.
-    Local dev: one docker-compose.yml that spins up ALL services together for testing.
-    Real prod: you DON'T use docker-compose. You use Kubernetes (or ECS, etc.)
-    docker-compose is a dev/testing tool, not a production orchestrator.
+BUT YOU CHANGED BURST TO 200, RIGHT?
 
-    Local dev compose:
-        services:
-          user-service:
-            build: ./user-service
-          order-service:
-            build: ./order-service
-          notification-service:
-            build: ./notification-service
-          postgres:
-            image: postgres:16
-          redis:
-            image: redis:7
+Here's the problem: THOSE ARE THE OLD BURST VALUES.
+You updated the nginx.conf FILE, but Nginx is still running with the OLD config.
 
-    Production: each service is deployed independently via CI/CD → K8s.
+Did you actually reload Nginx after editing the file?
+    docker compose exec nginx nginx -s reload
 
-SUMMARY:
-    Dockerfile    → one per custom service (separate code = separate Dockerfile)
-    Compose       → one shared file for local dev (convenient), NOT used in prod
-    Prod deploy   → Kubernetes manifests or cloud platform configs replace compose
+If you didn't, or if it failed silently, Nginx is still using burst=20.
+
+HOW TO VERIFY:
+
+    Step 1: Reload nginx now:
+        docker compose exec nginx nginx -s reload
+
+    Step 2: Verify config is loaded (check for errors):
+        docker compose exec nginx nginx -t
+
+        Should say: "syntax is ok" and "test is successful"
+
+    Step 3: Clear old logs so you can see fresh ones:
+        docker compose logs nginx --tail 0 -f
+
+        (This follows logs from NOW, ignoring old ones)
+
+    Step 4: Run a quick test — just 10 users for 30 seconds:
+        Create a file load-tests/quick.js:
+
+            import http from 'k6/http';
+            import { check } from 'k6';
+
+            export const options = {
+              vus: 10,
+              duration: '30s',
+            };
+
+            export default function () {
+              const res = http.get('http://localhost/healthcheck');
+              check(res, { 'status 200': (r) => r.status === 200 });
+            }
+
+        Run it:
+            k6 run load-tests/quick.js
+
+        If you see 100% success → Nginx is no longer rate-limiting.
+        If you still see failures → the reload didn't work. Try:
+            docker compose restart nginx
+
+    Step 5: Once the quick test passes, re-run the full test:
+        k6 run load-tests/basic.js
+
+
+WHY APP CPU WAS ONLY 8%:
+    Because Nginx blocked 97% of requests before they reached your app!
+    Your app only processed ~3% of the traffic (the ~400 requests that got through).
+    Of course it barely used any CPU — it barely did any work.
+
+    Once you fix the rate limiting, you should see:
+    - App CPU go much higher (maybe 30-80%)
+    - DB CPU go higher (actual queries running)
+    - Most checks passing (201, 302, 200)
+    - THAT'S when you find the real bottleneck
+
+
+AFTER YOU FIX AND RE-RUN, YOUR RESULTS SHOULD LOOK LIKE:
+    checks_succeeded: 90%+ (not 3%)
+    http_req_failed: <10% (not 97%)
+    App CPU: much higher than 8%
+    The errors that remain will show you the REAL bottleneck.
+
+
+
+Q7:
+
+C:\three-month-real-engg\TinyScale>k6 run load-tests/basic.js
+
+         /\      Grafana   /‾‾/
+    /\  /  \     |\  __   /  /
+   /  \/    \    | |/ /  /   ‾‾\
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/
+
+
+     execution: local
+        script: load-tests/basic.js
+        output: -
+
+     scenarios: (100.00%) 1 scenario, 100 max VUs, 4m0s max duration (incl. graceful stop):
+              * default: Up to 100 looping VUs for 3m30s over 5 stages (gracefulRampDown: 30s, gracefulStop: 30s)
+
+INFO[0001] Setup complete. Token obtained. 10 short URLs created.  source=console
+
+
+  █ THRESHOLDS
+
+    errors
+    ✗ 'rate<0.1' rate=97.10%
+
+    http_req_duration
+    ✓ 'p(95)<500' p(95)=23.37ms
+
+
+  █ TOTAL RESULTS
+
+    checks_total.......: 25447  119.91072/s
+    checks_succeeded...: 2.90%  738 out of 25447
+    checks_failed......: 97.09% 24709 out of 25447
+
+    ✗ shorten: status 201
+      ↳  3% — ✓ 83 / ✗ 2619
+    ✗ shorten: has shortCode
+      ↳  3% — ✓ 83 / ✗ 2619
+    ✗ redirect: status 302
+      ↳  2% — ✓ 267 / ✗ 9057
+    ✗ redirect: has Location
+      ↳  2% — ✓ 267 / ✗ 9057
+    ✗ stats: status 200
+      ↳  2% — ✓ 38 / ✗ 1357
+
+    CUSTOM
+    errors.........................: 97.10% 13033 out of 13421
+    redirect_duration..............: avg=11.981881 min=2.9278   med=5.7625  max=756.6381 p(90)=13.84366 p(95)=22.688585
+
+    HTTP
+    http_req_duration..............: avg=12.66ms   min=2.92ms   med=5.76ms  max=1.41s    p(90)=14.06ms  p(95)=23.37ms
+      { expected_response:true }...: avg=142.7ms   min=5.5ms    med=33.72ms max=1.41s    p(90)=461.09ms p(95)=524.03ms
+    http_req_failed................: 97.02% 13033 out of 13433
+    http_reqs......................: 13433  63.298648/s
+
+    EXECUTION
+    iteration_duration.............: avg=1.01s     min=500.26ms med=1.01s   max=2.75s    p(90)=1.41s    p(95)=1.46s
+    iterations.....................: 13354  62.926386/s
+    vus............................: 3      min=0              max=100
+    vus_max........................: 100    min=100            max=100
+
+    NETWORK
+    data_received..................: 6.0 MB 28 kB/s
+    data_sent......................: 2.2 MB 11 kB/s
 
 
 
 
+running (3m32.2s), 000/100 VUs, 13354 complete and 0 interrupted iterations
+default ✓ [======================================] 000/100 VUs  3m30s
+ERRO[0214] thresholds on metrics 'errors' have been crossed
 
-Q11: the status is ok but i am getting this error now?
+i want clear reason of why it iis failing? even i restarted and relaoed nginx?
 
-Internal Server Error
-$ curl -X POST http://localhost:3000/api/auth/register \
->       -H "Content-Type: application/json" \
->       -d '{"email":"docker@test.com","password":"test1234"}'
-{"error":"Internal Server Error","message":"Something went wrong","statusCode":500}
+A7: FOUND IT — IT'S YOUR APP'S RATE LIMITER, NOT NGINX
+--------------------------------------------------------
 
-what is theissue and ow to fix it
-how to test if both server and db are running ornot? commands?
+I checked the app logs. Every request is returning status 429 (Too Many Requests):
 
-A11:
------
-THE ERROR: "relation "users" does not exist"
-    = Tables were never created. Migrations didn't run before the app started.
+    app-1  | "statusCode":429  ← this, over and over
+    app-1  | "statusCode":429
+    app-1  | "statusCode":429
 
-WHY: Your docker-compose.yml has the migrate service, BUT the app doesn't
-    depend on it. So app started immediately without waiting for migrations.
+Nginx reload WORKED — no more "limiting requests" in Nginx logs. Nginx is
+passing all requests through now. But your APP has its OWN rate limiter!
 
-    Current:
-        app depends_on: db (healthy)        ← only waits for Postgres
-        migrate depends_on: db (healthy)    ← runs independently
+Look at src/plugins/rate-limit.plugin.ts:
 
-    Both start at the same time after db is healthy. App tries to query
-    tables that migrate hasn't created yet.
+    max: env.NODE_ENV === "test" ? 1000 : 100,
+    timeWindow: "1 minute",
+    keyGenerator: (request) => {
+        const apiKey = request.headers["x-api-key"];
+        if (typeof apiKey === "string") return apiKey;
+        return request.ip;      ← rate limit per IP
+    },
 
-FIX: Add migrate to app's depends_on in docker-compose.yml:
+    max: 100 requests per minute per IP.
+    NODE_ENV is "production" in Docker → max = 100.
 
-    app:
-      depends_on:
-        db:
-          condition: service_healthy
-        migrate:
-          condition: service_completed_successfully    ← ADD THIS
+THE MATH:
+    100 VUs × ~1 request/second = ~63 requests/second
+    After ~1.5 seconds → 100 requests used up
+    Remaining ~3 minutes and 28 seconds → ALL get 429
+    100 succeed / 13000+ total = ~3% success rate ← exactly what you see!
 
-    Now: db starts → migrate runs → migrate finishes → THEN app starts.
+YOU HAVE TWO LAYERS OF RATE LIMITING:
+    Layer 1: Nginx (connection level) — per IP, 500r/s (temporarily raised)
+    Layer 2: App (application level) — per IP, 100/minute
 
-After fixing, run:
+    You fixed Layer 1 but forgot about Layer 2.
+
+    User → Nginx (Layer 1: ✓ passes) → App (Layer 2: ✗ 429 blocked!)
+
+FIX FOR LOAD TESTING:
+    You don't want to change your source code just for testing.
+    Instead, set NODE_ENV to "test" in docker-compose.yml temporarily.
+
+    In docker-compose.yml, change the app's environment:
+        NODE_ENV: production
+    To:
+        NODE_ENV: test
+
+    This makes max = 1000 instead of 100 (from the ternary in your code).
+    That's still only 1000/minute though. For real load testing, you might
+    want to temporarily change the code to something like 10000.
+
+    OR — quicker fix: just restart with the env change:
+        docker compose down
+        docker compose up -d --build
+
+    Then re-run: k6 run load-tests/basic.js
+
+AFTER TESTING — CHANGE IT BACK:
+    Set NODE_ENV back to "production" in docker-compose.yml.
+    docker compose down && docker compose up -d --build
+
+THE LESSON HERE IS IMPORTANT:
+    You had TWO rate limiters and didn't realize it.
+    This happens in real production systems ALL THE TIME:
+        - CDN rate limits (Cloudflare)
+        - Load balancer rate limits (AWS ALB)
+        - Nginx rate limits
+        - App rate limits
+        - Database connection limits
+
+    When debugging "why are requests failing", you have to check EVERY layer.
+    The logs told you exactly where: Nginx said nothing (✓), App said 429 (✗).
+    Always check the logs of EACH container when debugging.
+
+Q8: but what are we trying to achieve with testing that many requests?
+
+A8: THE POINT IS NOT "SEND LOTS OF REQUESTS." THE POINT IS "FIND WHERE IT BREAKS."
+-------------------------------------------------------------------------------------
+
+Rate limiting is a PROTECTION feature. It works. You proved it.
+Load testing has a DIFFERENT goal: find the performance limits of your actual
+application logic — the code, the database, the memory.
+
+Think of it this way:
+    Rate limiting = the bouncer at the door (rejects too many people)
+    Load testing = how many customers can the kitchen serve before food gets slow?
+
+    You can't test the kitchen if the bouncer won't let anyone in.
+    So for load testing, you temporarily remove the bouncer.
+
+WHAT WE'RE ACTUALLY LOOKING FOR:
+
+    1. DATABASE BOTTLENECK:
+       At what point does Postgres slow down? 50 req/s? 200 req/s?
+       When connections max out (pool size = 10), new queries wait in line.
+       → This tells you: "I need connection pooling (PgBouncer) or Redis caching"
+
+    2. CPU BOTTLENECK:
+       Node.js is single-threaded. At what req/s does the CPU hit 100%?
+       → This tells you: "I need multiple app instances (scaling)"
+
+    3. MEMORY BOTTLENECK:
+       Does memory grow under load? Any memory leaks?
+       → This tells you: "I have a leak" or "I need more RAM"
+
+    4. RESPONSE TIME DEGRADATION:
+       At 10 req/s, response time = 5ms.
+       At 100 req/s, response time = 50ms.
+       At 500 req/s, response time = 2 seconds.
+       → WHERE does it start getting slow? That's the bottleneck.
+
+REAL EXAMPLE OF WHAT YOU SHOULD FIND:
+
+    "Without caching, my redirect endpoint hits Postgres on every request.
+     At 100 req/s, p(95) response time is 200ms.
+     DB CPU is at 80%. That's my bottleneck.
+     In Week 3, I'll add Redis caching — redirect checks Redis first,
+     skips Postgres entirely. Then re-test and compare the numbers."
+
+    THAT is what goes on your resume:
+    "Identified database as bottleneck at 100 req/s via load testing.
+     Added Redis caching, improved to 2000 req/s with p(95) < 10ms."
+
+SO THE PLAN:
+    1. Temporarily disable BOTH rate limiters (Nginx + app) ← just for testing
+    2. Run the load test — let ALL requests through to your app
+    3. Watch: CPU, memory, DB connections, response times
+    4. Find the bottleneck (probably DB since you have no caching yet)
+    5. Write down the numbers
+    6. Re-enable rate limiters
+    7. In Week 3: add Redis caching, re-test, compare numbers
+
+    It's not about breaking things for fun. It's about MEASURING your system
+    so you know WHAT to improve and can PROVE the improvement with numbers.
+
+
+
+Q9: but hwhat ths  small machine can do at max we ca't just rhogh at it thusands of requests to find uout the issue or what is the max capability the only optimization we can do is from our code side the machine is a bound to it's limitations right? so are we trying to find code optimizations or something else is also there ?
+
+A9: YES, YOUR MACHINE HAS LIMITS. THAT'S NOT THE POINT.
+---------------------------------------------------------
+
+You're right — your laptop has a ceiling. But the question isn't
+"how much can my laptop handle?" It's "how EFFICIENTLY does my code
+use the resources available?"
+
+Same laptop, same CPU, same RAM. Two different outcomes:
+
+    BAD CODE:   100 req/s → CPU 100%, p(95) = 2 seconds
+    GOOD CODE:  2000 req/s → CPU 80%, p(95) = 15ms
+
+Same machine. 20x more throughput. The difference is HOW you use the resources.
+
+WHAT CAN YOU ACTUALLY OPTIMIZE? (more than just "code")
+
+    1. AVOID UNNECESSARY WORK (biggest win)
+       Right now: every redirect → query Postgres → return URL
+       With Redis: every redirect → check Redis (0.1ms) → return URL
+       Postgres query = 5-20ms. Redis lookup = 0.1ms. 100x faster.
+       Same machine, same CPU — just smarter about where you look.
+
+    2. DO WORK LATER, NOT NOW (async processing)
+       Right now: click happens → write to clicks table → THEN redirect user
+       With queue: click happens → push to queue (0.1ms) → redirect immediately
+       A worker processes the queue in the background.
+       User gets redirected faster. Same machine.
+
+    3. DO LESS WORK PER REQUEST (query optimization)
+       SELECT * FROM urls WHERE short_code = 'abc'
+       Without index: Postgres scans EVERY row (slow as table grows)
+       With index: Postgres jumps directly to the row (fast always)
+       Same machine, same query, just an index.
+
+    4. REUSE CONNECTIONS (pooling)
+       Opening a new DB connection = 50ms overhead each time
+       Reusing from a pool = 0ms overhead
+       Same machine.
+
+    5. SCALE HORIZONTALLY (multiple instances)
+       Node.js = single-threaded = uses 1 CPU core
+       Your laptop has 4+ cores. 3 cores sit idle.
+       Run 3 app containers behind Nginx load balancer → 3x throughput.
+       Same machine, just using ALL cores instead of one.
+
+SO THE LOAD TEST ANSWERS:
+
+    "On THIS machine, with my CURRENT code, I can handle X req/s.
+     The bottleneck is Y (DB queries / CPU / connections).
+     After optimization Z, I can handle X×10 req/s."
+
+    Even on a small laptop you can find:
+    - Is it the DB? → add caching (Week 3)
+    - Is it the CPU? → add more app instances (Week 7, K8s)
+    - Is it connection limits? → add pooling
+    - Is it slow queries? → add indexes
+
+IN PROD (real servers), the same optimizations apply but at bigger scale:
+    Laptop: 100 → 2000 req/s after optimization
+    Prod server: 10,000 → 200,000 req/s after the SAME optimizations
+
+    The techniques you learn here transfer directly. The numbers just get bigger.
+
+BOTTOM LINE:
+    Machine = fixed ceiling at any point in time.
+    Your job = get as close to that ceiling as possible with efficient code.
+    Load testing = measuring how far you are from that ceiling and WHERE the gap is.
+
+Q10: really good points and good plan for lerning so now i really want to do that sohow should i procedd with it
+
+i really want to test by hitting it plain without reate limiters save the numbers and then tr with reate limiters and there again find the numbers and then we do optimizations in code/queires whatever is needed and then next steps so now you give me steps in this qna file and i will follow it in this so that we will completel k6 testing and move on ASAP? and i really want the tet itself toa capture the numbers and save the stats in the file itself test by test in different cases so that i can have to it we so we need that change as well let me do all the changes don't do it yourself please
+
+A10: LOAD TESTING PLAN — STEP BY STEP
+=======================================
+
+We'll run 3 tests, save results to JSON files, then compare.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1: PREPARE — DISABLE ALL RATE LIMITERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1: Disable Nginx rate limiting.
+    Open nginx/nginx.conf.
+    COMMENT OUT both limit_req_zone lines (add # at the start):
+
+        # limit_req_zone $binary_remote_addr zone=api:10m rate=500r/s;
+        # limit_req_zone $binary_remote_addr zone=login:10m rate=50r/s;
+
+    COMMENT OUT every limit_req line in EVERY location block (both port 80 and 443).
+    There are 6 of them total (3 in port 80 block, 3 in port 443 block):
+
+        # limit_req zone=login burst=50 nodelay;
+        # limit_req zone=api burst=200 nodelay;
+        # limit_req zone=api burst=50 nodelay;
+        (and same 3 in the 443 block)
+
+Step 2: Disable app rate limiting.
+    Open src/plugins/rate-limit.plugin.ts.
+    Change:
+        max: env.NODE_ENV === "test" ? 1000 : 100,
+    To:
+        max: 50000,
+
+Step 3: Rebuild and start:
     docker compose down
-    docker compose up --build
+    docker compose up -d --build
 
-HOW TO CHECK IF EVERYTHING IS RUNNING:
-
-    docker compose ps                     ← shows all containers + status
-    docker compose logs app --tail 10     ← last 10 lines of app logs
-    docker compose logs db --tail 10      ← last 10 lines of db logs
-    docker compose logs migrate           ← did migration succeed?
-
-    # Check if app responds:
-    curl http://localhost:3000/healthcheck
-
-    # Check if Postgres has tables (from your machine):
-    docker compose exec db psql -U dev tinyscale -c '\dt'
-    # Should list: users, urls, clicks tables
-
-    Q12: i udnerstood t but why the migration didn't happened if it takes some time but triggered right? may be after few second but it should have been migration succcess right? or what?
+Step 4: Verify everything is up:
+    curl http://localhost/healthcheck
 
 
-    Q13: error now
-    db-1  |
-db-1  | PostgreSQL Database directory appears to contain a database; Skipping initialization
-db-1  |
-db-1  | 2026-03-28 15:33:43.216 UTC [1] LOG:  starting PostgreSQL 16.13 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
-db-1  | 2026-03-28 15:33:43.217 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
-db-1  | 2026-03-28 15:33:43.217 UTC [1] LOG:  listening on IPv6 address "::", port 5432
-db-1  | 2026-03-28 15:33:43.226 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
-db-1  | 2026-03-28 15:33:43.239 UTC [29] LOG:  database system was shut down at 2026-03-28 15:32:30 UTC
-db-1  | 2026-03-28 15:33:43.251 UTC [1] LOG:  database system is ready to accept connections
- Container tinyscale-db-1 Healthy
- Container tinyscale-migrate-1 Starting
- Container tinyscale-migrate-1 Started
- Container tinyscale-db-1 Waiting
- Container tinyscale-migrate-1 Waiting
- Container tinyscale-db-1 Healthy
-migrate-1  | No config path provided, using default 'drizzle.config.json'
-migrate-1  | /app/drizzle.config.json file does not exist
- Container tinyscale-migrate-1 Error service "migrate" didn't complete successfully: exit 1
-service "migrate" didn't complete successfully: exit 1
- Note: Please let me do it any changes needed i see you added that depedns_on by yourself then how can i learn things?
- lets fix this steps and run it agin
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2: UPDATE THE LOAD TEST SCRIPT TO SAVE RESULTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-A12: WHY MIGRATION DIDN'T "EVENTUALLY" SUCCEED
--------------------------------------------------
-Before you added depends_on for migrate, compose started app and migrate
-at the same time (both only waited for db). But:
+k6 can output results to a JSON file using the --out flag.
+You don't need to change the script for this. But let's also add
+a handleSummary function so k6 saves a nice summary automatically.
 
-    - migrate FAILED (we'll see why in A13)
-    - migrate exited with error code 1
-    - app didn't care — it had no depends_on for migrate
-    - app started anyway, tried to query tables that don't exist → 500 error
+Step 5: Open load-tests/basic.js and add this function at the BOTTOM
+    of the file (after the default function, before the END comment):
 
-Even if migrate had succeeded, there was a RACE CONDITION:
-    - migrate might take 3 seconds to create tables
-    - app might start in 1 second and try to query immediately
-    - Without depends_on: service_completed_successfully, there's no guarantee
-      migrate finishes before app's first query
+    export function handleSummary(data) {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `load-tests/results-${timestamp}.json`;
+      const summary = {
+        timestamp: new Date().toISOString(),
+        metrics: {
+          http_reqs: data.metrics.http_reqs.values,
+          http_req_duration: data.metrics.http_req_duration.values,
+          http_req_failed: data.metrics.http_req_failed.values,
+          errors: data.metrics.errors ? data.metrics.errors.values : null,
+          redirect_duration: data.metrics.redirect_duration ? data.metrics.redirect_duration.values : null,
+        },
+        checks: {
+          total: data.metrics.checks.values.passes + data.metrics.checks.values.fails,
+          passes: data.metrics.checks.values.passes,
+          fails: data.metrics.checks.values.fails,
+          passRate: (data.metrics.checks.values.passes / (data.metrics.checks.values.passes + data.metrics.checks.values.fails) * 100).toFixed(2) + '%',
+        },
+      };
 
-That's why the depends_on fix was needed — it makes the order deterministic:
-    db healthy → migrate runs and COMPLETES → then app starts
+      return {
+        [filename]: JSON.stringify(summary, null, 2),
+        stdout: textSummary(data, { indent: ' ', enableColors: true }),
+      };
+    }
+
+    ALSO add this import at the TOP of the file (with the other imports):
+        import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
+
+    This makes k6 automatically save a JSON file with all the numbers
+    after every test run. Each file gets a unique timestamp name.
 
 
-A13: WHY MIGRATE FAILED — "drizzle.config.json file does not exist"
---------------------------------------------------------------------
-Read the error carefully:
-    "No config path provided, using default 'drizzle.config.json'"
-    "/app/drizzle.config.json file does not exist"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3: RUN TEST 1 — NO RATE LIMITERS (baseline)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Two problems here:
+Step 6: Run the test:
+    k6 run load-tests/basic.js
 
-PROBLEM 1: drizzle-kit looks for drizzle.config.json but yours is drizzle.config.ts
-    drizzle-kit needs to be told where the config file is.
+Step 7: While it runs, open ANOTHER terminal and watch:
+    docker stats
 
-PROBLEM 2: Your Dockerfile never copies drizzle.config.ts into the image.
-    Look at your Dockerfile builder stage:
-        COPY package.json package-lock.json ./
-        COPY tsconfig.json ./
-        COPY src/ ./src/
+    Note these numbers during peak load (when VUs = 100):
+    - App CPU %
+    - DB CPU %
+    - App memory
+    - DB memory
 
-    No drizzle.config.ts! It's not inside the container.
+Step 8: After it finishes:
+    - A results JSON file will be saved automatically in load-tests/
+    - k6 prints the summary to console too
+    - Write down: peak req/s, p(95) duration, error rate, which container had highest CPU
 
-HERE'S WHAT YOU NEED TO DO (two changes):
 
-CHANGE 1: Add drizzle.config.ts to the Dockerfile builder stage.
-    Open Dockerfile and add this line AFTER "COPY tsconfig.json ./":
-        COPY drizzle.config.ts ./
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4: RUN TEST 2 — WITH RATE LIMITERS (production config)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    Your builder stage should look like:
-        FROM node:22-alpine AS builder
-        WORKDIR /app
-        COPY package.json package-lock.json ./
-        RUN npm ci
-        COPY tsconfig.json ./
-        COPY drizzle.config.ts ./          ← ADD THIS LINE
-        COPY src/ ./src/
-        RUN npm run build
+Step 9: Re-enable Nginx rate limiting.
+    Open nginx/nginx.conf.
+    UNCOMMENT the limit_req_zone lines (remove the #):
+        limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+        limit_req_zone $binary_remote_addr zone=login:10m rate=3r/s;
 
-CHANGE 2: Tell drizzle-kit where the config file is.
-    Open docker-compose.yml and update the migrate command:
-        command: ["npx", "drizzle-kit", "push", "--config=drizzle.config.ts"]
+    UNCOMMENT all 6 limit_req lines in the location blocks.
+    Set them back to ORIGINAL values:
+        burst=20 for api zones
+        burst=5 for login zones
 
-    This tells drizzle-kit: "don't look for drizzle.config.json,
-    use drizzle.config.ts instead."
+Step 10: Re-enable app rate limiting.
+    Open src/plugins/rate-limit.plugin.ts.
+    Change back:
+        max: env.NODE_ENV === "test" ? 1000 : 100,
 
-AFTER BOTH CHANGES, run:
+Step 11: Rebuild and reload:
     docker compose down
-    docker compose up --build
+    docker compose up -d --build
 
-WHAT SHOULD HAPPEN:
-    1. db starts and becomes healthy
-    2. migrate starts, finds drizzle.config.ts, connects to db, creates tables
-    3. migrate exits successfully (exit code 0)
-    4. app starts, tables exist, everything works
-    5. Try: curl -X POST http://localhost:3000/api/auth/register \
-             -H "Content-Type: application/json" \
-             -d '{"email":"docker@test.com","password":"test1234"}'
+Step 12: Run the test again:
+    k6 run load-tests/basic.js
 
-    You should get a success response this time!
-
-LESSON: When debugging Docker, always think:
-    "Does the file exist INSIDE the container?"
-    Not on your machine — inside the container.
-    If you didn't COPY it in the Dockerfile, it's not there.
+    Another results JSON saved automatically.
+    This time you'll see lots of 429s and 503s — that's the rate limiters doing their job.
 
 
-Q14: so what if we only have one single repo/project only then what has to happen so that we would need two m or mroe Dockerfiles instead of one's does it work tahta way or always one Dockerfile will be enough?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 5: COMPARE AND DOCUMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-A14:
+Step 13: Create load-tests/results.md and write your findings:
+
+    # Load Test Results — Week 2 Day 7
+
+    ## Test Setup
+    - Machine: [your laptop specs — CPU, RAM]
+    - 100 virtual users, 3.5 minute test
+    - Traffic mix: 20% writes, 70% redirects, 10% stats
+
+    ## Test 1: No Rate Limiters (baseline)
+    - Peak req/s: ___
+    - p(95) response time: ___ ms
+    - Error rate: ___%
+    - App CPU peak: ___%
+    - DB CPU peak: ___%
+    - Bottleneck: [what maxed out first?]
+
+    ## Test 2: With Rate Limiters (production)
+    - Peak req/s: ___
+    - p(95) response time: ___ ms
+    - Error rate: ___% (expected high — rate limiters doing their job)
+    - Requests that got through: ___ out of ___
+
+    ## Key Findings
+    - Without rate limiters, the bottleneck was: ___
+    - Rate limiters effectively protect the app at: ___ req/s per IP
+    - Response times for successful requests: ___ ms
+
+    ## What I'd Optimize Next (Week 3)
+    - Add Redis caching for redirects (avoid DB hit per redirect)
+    - Move click tracking to background queue (faster redirect response)
+    - [anything else you noticed]
+
+Step 14: The JSON results files in load-tests/ are your raw data backup.
+    You can look at them anytime to compare numbers precisely.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 6: DONE — REVERT EVERYTHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After Phase 5, everything should already be back to production config
+(you reverted in Step 9-11). Double check:
+
+    [ ] nginx.conf: rate=10r/s (api), rate=3r/s (login), burst=20/5
+    [ ] rate-limit.plugin.ts: max: env.NODE_ENV === "test" ? 1000 : 100
+    [ ] docker-compose.yml: NODE_ENV: production
+
+Final rebuild:
+    docker compose down
+    docker compose up -d --build
+
+Week 2 Day 7 is DONE. Move on to Week 3: Redis + Caching.
+You'll re-run these same tests AFTER adding Redis to see the improvement.
+
+Q11: i geuss both of the runs are good i thik there is nothing tolearn from the without rate imlimit test and it just ran smooth without andy errors and the one with rate limiters in both app and niginx is the same result whch we were getting preiuovsly so read both of them and let mw know what is the lerning?
+
+A11: THERE'S ACTUALLY A LOT TO LEARN HERE. LET'S READ THE NUMBERS.
+====================================================================
+
+TEST 1 — NO RATE LIMITERS (baseline):
+    Total requests:   13,383
+    Throughput:        63 req/s
+    Pass rate:         100% ✓ (all 25,377 checks passed)
+    Error rate:        0%
+    p(95) duration:    10.37ms
+    Redirect p(95):    5.93ms
+    Max duration:      486ms (one slow outlier)
+    CPU:               didn't even reach 1 GiB memory across containers
+
+TEST 2 — WITH RATE LIMITERS (production):
+    Total requests:   13,608
+    Throughput:        64 req/s
+    Pass rate:         2.46% (only 635 out of 25,775 checks passed)
+    Error rate:        97%
+    p(95) duration:    4.63ms (faster! because most requests are instant 429 rejections)
+    Successful req p(95): 16.76ms
+
+WHAT WE LEARNED:
+
+1. YOUR APP CAN HANDLE 63 req/s WITH 100 USERS WITHOUT BREAKING.
+   That's your baseline. No errors. No CPU spike. No memory issues.
+   This is actually a GOOD result for a simple setup without caching.
+
+   But here's the thing: 63 req/s is NOT your app's limit.
+   It's k6's limit with the current config (100 users, each sleeping 0.5-1.5s).
+   To find the ACTUAL ceiling, you'd need more users or less sleep time.
+
+2. YOUR APP IS FAST — BUT IT'S NOT BEING PUSHED HARD ENOUGH.
+   p(95) = 10ms means 95% of requests complete in 10 milliseconds.
+   CPU didn't spike. Memory stayed low.
+
+   This tells you: at 63 req/s, your app is BORED. It's not even trying.
+   The bottleneck isn't your app or DB at this load — it's the test itself.
+
+3. RATE LIMITERS WORK EXACTLY AS DESIGNED.
+   Test 2 shows: 97% rejected, 3% got through.
+   100 req/min app limit ÷ 64 req/s = limit hit in ~1.5 seconds.
+   Rest of the 3.5 minutes → all 429.
+
+   The requests that DID get through were slower (p(95) = 16.76ms vs 10.37ms)
+   because the rate limiter adds overhead checking every request.
+
+4. THE INTERESTING COMPARISON FOR YOUR RESUME:
+
+   ┌──────────────────┬─────────────────┬─────────────────────┐
+   │ Metric           │ No Rate Limit   │ With Rate Limit     │
+   ├──────────────────┼─────────────────┼─────────────────────┤
+   │ Requests served  │ 13,383 (100%)   │ 400 (2.9%)          │
+   │ Pass rate        │ 100%            │ 2.46%               │
+   │ p(95) all reqs   │ 10.37ms         │ 4.63ms              │
+   │ p(95) success    │ 10.37ms         │ 16.76ms             │
+   │ Redirect p(95)   │ 5.93ms          │ 4.21ms              │
+   └──────────────────┴─────────────────┴─────────────────────┘
+
+5. WHAT'S MISSING — THE REAL BOTTLENECK TEST:
+   You haven't actually found the ceiling yet because the load was too light.
+   At 63 req/s your app handles everything easily.
+
+   The REAL questions are answered in Week 3:
+   - Without Redis: at what req/s does the DB become the bottleneck?
+   - With Redis: how much faster do redirects get?
+
+   Right now every redirect = 1 Postgres query (~5ms).
+   With Redis cache: every redirect = 1 Redis lookup (~0.1ms).
+   That's a 50x improvement on the hot path.
+
+   When you add Redis in Week 3, you'll re-run this SAME test and compare:
+   "Before Redis: redirect p(95) = 5.93ms"
+   "After Redis: redirect p(95) = 0.5ms"
+
+   THAT comparison is the money number for your resume.
+
+WRITE THIS IN load-tests/results.md:
+
+   # Load Test Results — Week 2 Day 7
+
+   ## Machine
+   - Windows 11, [your CPU], 3.5 GiB RAM (Docker limit)
+
+   ## Test 1: No Rate Limiters (baseline)
+   - 100 VUs, 3.5 minutes, 63 req/s
+   - 100% pass rate, 0% errors
+   - p(95) response time: 10.37ms
+   - Redirect p(95): 5.93ms
+   - CPU/Memory: minimal usage — app not stressed at this load
+
+   ## Test 2: With Rate Limiters
+   - Same load, but 97% requests rejected (429)
+   - Only 400 out of 13,608 requests served
+   - Rate limiters working as designed
+
+   ## Key Findings
+   - App handles 63 req/s easily without caching
+   - No bottleneck found at this load level
+   - Rate limiters effectively protect the app
+
+   ## Next Steps (Week 3)
+   - Add Redis caching for redirect lookups
+   - Re-run load test and compare redirect latency
+   - Push to higher load to find actual ceiling
+
+WEEK 2 IS DONE. These numbers are your "before" snapshot.
+Week 3 will give you the "after" numbers. The delta is what matters.
+
+
+Q12: so you don't want me peak the limits of the containers with requests to find the bottlenects which we sdiscusses is the real learning in either machine s is capped cant't do anythig or there is some issues with connections/queires/db etc or anything we cn do to optimize code to make it faster
+
+one thing sis confirmed tah machine is limited so we have to difind out what is the max can it handle without giving any issues if that is already we have achieved and there is nothing we can do from ourside other tht  machine than we are good the only thing should be penindg is adding more machines or utilizing more resources from the machine?
+
+A12: YOU'RE RIGHT — WE HAVEN'T PEAKED IT YET. BUT THAT'S WEEK 3'S JOB.
+========================================================================
+
+Here's why I'm not asking you to push harder RIGHT NOW:
+
+At 63 req/s, every redirect does: App → Postgres query → return URL.
+If you push to 500 req/s, the bottleneck WILL be Postgres (guaranteed).
+You'll find it. But then what? The fix is Redis caching — which is Week 3.
+
+So the plan is:
+
+    Week 2 (now):  baseline numbers at 63 req/s → everything fine ✓
+    Week 3 (next): add Redis caching → re-test → push MUCH harder
+                   NOW you'll see the difference:
+                   - Without Redis at 500 req/s → DB chokes, p(95) spikes
+                   - With Redis at 500 req/s → cache hits, p(95) stays low
+
+    Finding the bottleneck is only useful if you can FIX it right after.
+    Otherwise you're just watching things break with no next step.
+
+BUT — if you WANT to see it break right now just for learning, here's how.
+Create load-tests/stress.js:
+
+    import http from 'k6/http';
+    import { check } from 'k6';
+
+    export const options = {
+      stages: [
+        { duration: '30s', target: 200 },
+        { duration: '1m', target: 500 },
+        { duration: '30s', target: 500 },
+        { duration: '30s', target: 0 },
+      ],
+    };
+
+    export default function () {
+      const res = http.get('http://localhost/healthcheck');
+      check(res, { 'status 200': (r) => r.status === 200 });
+    }
+
+    (No sleep, no auth, just pure healthcheck hammering)
+
+    Make sure rate limiters are still disabled, then:
+        k6 run load-tests/stress.js
+
+    Watch docker stats in another terminal. You'll see:
+    - App CPU climb toward 100%
+    - At some point, response times spike
+    - THAT'S the ceiling of your single Node.js instance
+
+    This is optional. The REAL comparison happens in Week 3.
+
+YOUR UNDERSTANDING IS CORRECT:
+
+    ┌─ What you can't change ───────────────────────────┐
+    │ CPU cores, RAM, disk speed = machine limits        │
+    └───────────────────────────────────────────────────┘
+            ↓
+    ┌─ What you CAN change (this is the engineering) ───┐
+    │ 1. Caching (Redis) — avoid slow DB calls          │  ← Week 3
+    │ 2. Async processing (queues) — don't block user   │  ← Week 3
+    │ 3. Query optimization (indexes) — faster DB       │  ← Done (Week 1)
+    │ 4. Connection pooling — reuse DB connections       │  ← Done (Drizzle)
+    │ 5. Multiple instances — use all CPU cores          │  ← Week 7 (K8s)
+    │ 6. Horizontal scaling — add more machines          │  ← Week 7 (K8s)
+    └───────────────────────────────────────────────────┘
+
+    Right now you've done 3 and 4. Weeks 3 and 7 add the rest.
+    EACH one gives you a measurable improvement to compare against your baseline.
+
+    Your baseline: 63 req/s, p(95) = 10ms, redirect p(95) = 5.93ms.
+    Save these. You'll compare against them for the rest of the project.
+
+MOVE ON TO WEEK 3. That's where the real optimization story begins.
+
+Q13: how do docker images get their names?
+
+A13:
 -----
-One repo CAN have multiple Dockerfiles. It depends on whether you have
-multiple DIFFERENT things to run.
+Two ways images get named:
 
-WHEN ONE DOCKERFILE IS ENOUGH (like TinyScale right now):
-    - One app, one runtime (Node.js)
-    - migrate service reuses the same Dockerfile (just targets a different stage)
-    - One Dockerfile, multiple stages = enough
+1. YOU NAME IT with -t when building manually:
+       docker build -t tinyscale:latest .
+                      ↑ you chose this name
 
-WHEN YOU NEED MULTIPLE DOCKERFILES (same repo):
-    Example: your repo has a Node.js API + a Go worker + a Python ML service
+2. DOCKER COMPOSE names it automatically:
+       Format: {project-folder}_{service-name}
 
-        my-project/
-            api/
-                Dockerfile          ← Node.js
-            worker/
-                Dockerfile          ← Go
-            ml-service/
-                Dockerfile          ← Python
-            docker-compose.yml      ← runs all three
+       Your docker-compose.yml has services: app, migrate, db
+       Your folder is called "tinyscale" (or "TinyScale")
 
-    Each needs a different base image, different build steps, different runtime.
-    You can't fit Node + Go + Python into one Dockerfile sensibly.
+       So compose creates:
+           tinyscale-app        ← from "app" service (built from your Dockerfile)
+           tinyscale-migrate    ← from "migrate" service (same Dockerfile, target: builder)
+           postgres:16-alpine   ← from "db" service (pre-built, keeps original name)
+           nginx:alpine         ← from "nginx" service (pre-built, keeps original name)
 
-    In compose you'd reference them separately:
-        services:
-          api:
-            build: ./api
-          worker:
-            build: ./worker
-          ml:
-            build: ./ml-service
+       Run `docker images` and you'll see both:
+           tinyscale-app       latest    150MB   ← compose auto-named
+           tinyscale-migrate   latest    400MB   ← compose auto-named
+           tinyscale           latest    150MB   ← your manual build from Step 5 (if still there)
+           postgres            16-alpine 240MB   ← pulled from Docker Hub
+           nginx               alpine    40MB    ← pulled from Docker Hub
 
-RULE OF THUMB:
-    Same language, same build process → one Dockerfile (use multi-stage)
-    Different languages or fundamentally different builds → separate Dockerfiles
+NAMING CONVENTION:
+    name:tag
+    tinyscale:latest    ← name = tinyscale, tag = latest
+    postgres:16-alpine  ← name = postgres, tag = 16-alpine
+    node:22-alpine      ← name = node, tag = 22-alpine
 
-
-Q15: all of that work good i jsut need to stest Step 10 then i guess we are good with it?
-
-A15:
------
-Yes! Go through Step 10 from week2.txt. Here's your checklist:
-
-    [ ] docker compose ps                          ← see running containers
-    [ ] docker compose logs app --tail 5           ← app logs
-    [ ] docker compose logs db --tail 5            ← db logs
-    [ ] docker compose exec app sh                 ← go inside app container
-        Inside: ls, whoami, cat /etc/os-release, exit
-    [ ] docker compose exec db psql -U dev tinyscale  ← go inside Postgres
-        Inside: \dt, SELECT count(*) FROM users;, \q
-    [ ] docker volume ls                           ← see volumes
-    [ ] docker network ls                          ← see networks
-
-    THEN TEST PERSISTENCE:
-    [ ] Register a user via curl
-    [ ] docker compose down (NOT -v)
-    [ ] docker compose up
-    [ ] Check user still exists (login with same credentials)
-    [ ] docker compose down -v (WITH -v)
-    [ ] docker compose up --build
-    [ ] Try login → should fail (data gone, volume deleted)
-
-After all that, Day 1-2 is DONE. You're ready for Day 3-4 (Nginx reverse proxy).
-
-
-Q16: i want to understand this thing better like we got few issues adnw we fixed it with docekr down command but actually did we created new image or did we use same images then what is the change that would actually require to hange image or rebuild the imgae Docekrfile or code itsefl or something else ad what exactly we did when we get error while running those image contaners?
-
-A16: IMAGE vs CONTAINER — WHEN DOES WHAT GET REBUILT?
-------------------------------------------------------
-This is a crucial distinction. Let's be very precise.
-
-IMAGE = the snapshot (built once, doesn't change until you rebuild)
-CONTAINER = a running instance of an image (can be created/destroyed freely)
-
-WHAT REQUIRES A NEW IMAGE (must use --build):
-    ┌──────────────────────────────────────────────────────────┐
-    │ Change                          │ New image needed?      │
-    ├──────────────────────────────────────────────────────────┤
-    │ Changed source code (src/)      │ YES → --build          │
-    │ Changed Dockerfile              │ YES → --build          │
-    │ Changed package.json            │ YES → --build          │
-    │ Added drizzle.config.ts to COPY │ YES → --build          │
-    │ Changed tsconfig.json           │ YES → --build          │
-    └──────────────────────────────────────────────────────────┘
-
-WHAT DOES NOT REQUIRE A NEW IMAGE (just restart containers):
-    ┌──────────────────────────────────────────────────────────┐
-    │ Change                          │ New image needed?      │
-    ├──────────────────────────────────────────────────────────┤
-    │ Changed env vars in compose     │ NO → just down + up    │
-    │ Changed ports in compose        │ NO → just down + up    │
-    │ Changed depends_on in compose   │ NO → just down + up    │
-    │ Changed volumes in compose      │ NO → just down + up    │
-    │ Changed networks in compose     │ NO → just down + up    │
-    └──────────────────────────────────────────────────────────┘
-
-NOW LET'S TRACE EXACTLY WHAT HAPPENED WITH OUR FIXES:
-
-FIX 1: Added depends_on migrate to app (docker-compose.yml only)
-    → Compose change only. No code/Dockerfile changed.
-    → docker compose down + docker compose up was enough (no --build needed)
-    → Same image, just different container startup order
-
-FIX 2: Added COPY drizzle.config.ts to Dockerfile + changed migrate command
-    → Dockerfile changed = image changed = MUST use --build
-    → docker compose up --build rebuilt the image with drizzle.config.ts inside
-    → New image created, old one still exists (dangling)
-
-THE COMMANDS AND WHAT THEY DO:
-    docker compose down          → stops + removes containers (images stay)
-    docker compose up            → creates + starts containers from EXISTING images
-    docker compose up --build    → REBUILDS images first, then creates + starts containers
-    docker compose down -v       → stops + removes containers + deletes volumes (data gone)
-
-WHEN IN DOUBT:
-    - Changed anything in Dockerfile or source code? → use --build
-    - Changed only docker-compose.yml? → just down + up
-    - Want a completely clean slate? → down -v + up --build
-
-TRY THIS to see your images:
-    docker images
-    You might see multiple tinyscale images. The old ones are from before your fix.
-    Clean up old ones: docker image prune (removes unused/dangling images)
-
-
-Q17: is oit possible to have one single docker compose for multiple Dockerfiles each one bleongs different micro service or projects? as i see we are just dealing with docker compose command and not plain docker comands
-
-A17:
------
-YES. One compose file can reference multiple Dockerfiles from different folders.
-
-    my-company/
-        user-service/
-            Dockerfile
-            src/
-        payment-service/
-            Dockerfile
-            src/
-        notification-service/
-            Dockerfile
-            src/
-        docker-compose.yml          ← ONE file, THREE Dockerfiles
-
-    docker-compose.yml:
-        services:
-          user-service:
-            build:
-              context: ./user-service
-              dockerfile: Dockerfile
-            ports: ["3001:3000"]
-
-          payment-service:
-            build:
-              context: ./payment-service
-              dockerfile: Dockerfile
-            ports: ["3002:3000"]
-
-          notification-service:
-            build:
-              context: ./notification-service
-              dockerfile: Dockerfile
-            ports: ["3003:3000"]
-
-          postgres:
-            image: postgres:16-alpine
-
-          redis:
-            image: redis:7
-
-    `docker compose up --build` → builds all three images, starts everything.
-
-WHY PLAIN docker COMMANDS STILL MATTER:
-    docker compose is just a convenience wrapper. Under the hood it runs
-    plain docker commands. Knowing both matters because:
-
-    - CI/CD pipelines often use plain `docker build` + `docker push`
-    - Debugging a single container: `docker run`, `docker exec`, `docker logs`
-    - Compose is for LOCAL DEV. Production uses K8s, ECS, etc. — not compose.
-
-    But for local development, yes — compose is all you need.
+    Tags are versions. "latest" is the default if you don't specify one.
+    In prod you NEVER use "latest" — you pin a specific version so deploys are predictable.

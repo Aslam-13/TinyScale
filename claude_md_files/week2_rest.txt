@@ -1,0 +1,1359 @@
+================================================================================
+                    WEEK 2: DAY 3-7 (REST OF THE WEEK)
+                    ===================================
+                    Day 3-4: Nginx Reverse Proxy
+                    Day 5-6: Networking Fundamentals
+                    Day 7: Load Testing with k6
+================================================================================
+
+
+================================================================================
+DAY 3-4: NGINX AS REVERSE PROXY
+================================================================================
+
+BEFORE YOU TOUCH ANY COMMANDS - READ AND UNDERSTAND THIS:
+----------------------------------------------------------
+
+>> WHAT IS A REVERSE PROXY? <<
+
+Right now your setup looks like this:
+
+    User (browser/curl) ──→ :3000 ──→ Your Node.js App ──→ Postgres
+
+The user talks DIRECTLY to your Node.js app. This is fine for development.
+In production, this is a terrible idea. Why?
+
+1. YOUR APP IS SINGLE-PURPOSE: It should handle business logic (shorten URLs,
+   track clicks). It should NOT handle SSL certificates, compression, static
+   files, rate limiting at the connection level, or load balancing.
+
+2. NODE.JS IS SINGLE-THREADED: One slow request blocks everything. If someone
+   sends a massive request body or a slow connection, your entire app stalls.
+
+3. NO SSL TERMINATION: Your app would need to handle HTTPS itself. That means
+   loading certificates, handling TLS handshakes — things a web server does
+   much better and faster.
+
+4. NO BUFFERING: If a client is on a slow 3G connection and sends a 10MB body
+   very slowly, your Node.js process is tied up waiting. Nginx buffers the
+   entire request first, then forwards it to Node instantly.
+
+A REVERSE PROXY sits BETWEEN the user and your app:
+
+    User ──→ :80/:443 ──→ Nginx (reverse proxy) ──→ :3000 ──→ Your App ──→ Postgres
+
+Nginx handles:
+    - SSL/TLS (HTTPS) — terminates SSL, talks plain HTTP to your app
+    - Compression (gzip) — compresses responses before sending to client
+    - Rate limiting — blocks abusive clients before they reach your app
+    - Static files — serves images, CSS, JS directly without bothering your app
+    - Buffering — absorbs slow clients so your app isn't waiting
+    - Load balancing — can forward to multiple app instances (we'll use this in K8s)
+
+>> WHY NGINX AND NOT SOMETHING ELSE? <<
+
+    Nginx = the most popular reverse proxy/web server in the world.
+    Used by Netflix, Cloudflare, GitHub, Dropbox, WordPress.com.
+    It handles millions of concurrent connections with minimal memory.
+    Alternatives: Caddy (simpler), HAProxy (more for TCP), Traefik (K8s-native).
+    But Nginx is the industry standard — learn it first.
+
+
+================================================================================
+STEP 1: CREATE NGINX CONFIGURATION FILE
+================================================================================
+
+First, create a folder for Nginx config:
+
+    mkdir nginx
+
+Then create the file `nginx/nginx.conf` in TinyScale root.
+TYPE EVERY LINE. Read the explanation for each section.
+
+--- START OF nginx/nginx.conf ---
+
+# Number of worker processes. auto = one per CPU core.
+# Each worker can handle thousands of connections.
+worker_processes auto;
+
+# Where Nginx logs errors. stderr = Docker can capture it.
+error_log /var/log/nginx/error.log warn;
+
+events {
+    # Max simultaneous connections PER WORKER.
+    # 1024 workers x 4 CPUs = 4096 potential connections.
+    worker_connections 1024;
+}
+
+http {
+    # ---- BASIC SETTINGS ----
+
+    # Include MIME types so Nginx knows .css is text/css, .js is application/javascript, etc.
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Log format — this is what you see in `docker compose logs nginx`
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" rt=$request_time';
+
+    access_log /var/log/nginx/access.log main;
+
+    # sendfile = efficient file transfer. Sends files directly from disk to network
+    # without copying to userspace. Faster for static files.
+    sendfile on;
+
+    # Don't send partial frames. Wait until a full frame is ready.
+    # Better for performance — fewer packets sent.
+    tcp_nopush on;
+
+    # Keep connections alive for 65 seconds.
+    # Without keep-alive, every request opens a new TCP connection (slow).
+    # With keep-alive, multiple requests reuse the same connection.
+    keepalive_timeout 65;
+
+
+    # ---- GZIP COMPRESSION ----
+    # Compresses responses before sending to client.
+    # A 100KB JSON response becomes ~20KB after gzip.
+    # Less data = faster for the user, less bandwidth.
+
+    gzip on;
+    gzip_vary on;
+    # gzip_vary adds "Vary: Accept-Encoding" header so caches know
+    # there are compressed and uncompressed versions.
+
+    gzip_proxied any;
+    # Compress responses from proxied requests too (our app).
+
+    gzip_comp_level 6;
+    # Compression level 1-9. 6 is a good balance between CPU usage and compression ratio.
+    # 1 = fast but less compression. 9 = slow but max compression.
+
+    gzip_types text/plain text/css application/json application/javascript
+               text/xml application/xml application/xml+rss text/javascript;
+    # Only compress these content types. Don't compress images (already compressed).
+
+
+    # ---- RATE LIMITING ----
+    # This is Nginx-level rate limiting — BEFORE requests even reach your app.
+    # Your app has its own rate limiting too (per API key).
+    # Nginx rate limiting protects against DDoS and brute force at the connection level.
+
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    # $binary_remote_addr = rate limit per client IP address
+    # zone=api:10m = name this zone "api", allocate 10MB memory for tracking IPs
+    #   (10MB can track ~160,000 unique IPs)
+    # rate=10r/s = allow 10 requests per second per IP
+
+    limit_req_zone $binary_remote_addr zone=login:10m rate=3r/s;
+    # Stricter rate limit for login/register — 3 requests per second per IP
+    # Why stricter? To prevent brute-force password attacks.
+
+
+    # ---- UPSTREAM (your app) ----
+    # Define where your app is. Nginx forwards requests here.
+    # "upstream" is Nginx's way of defining backend servers.
+    # Later with multiple app containers, you'd list them all here for load balancing.
+
+    upstream tinyscale_app {
+        server app:3000;
+        # "app" = the service name in docker-compose. Docker DNS resolves it.
+        # If you had 3 app containers, you'd list them all:
+        #   server app1:3000;
+        #   server app2:3000;
+        #   server app3:3000;
+        # Nginx would load-balance between them (round-robin by default).
+    }
+
+
+    # ---- SERVER BLOCK (HTTP — port 80) ----
+    server {
+        listen 80;
+        server_name localhost;
+
+        # --- Security Headers ---
+        # These headers protect against common web attacks.
+        add_header X-Content-Type-Options "nosniff" always;
+        # Prevents browser from MIME-sniffing (guessing content type).
+        # Without this, a browser might execute a .txt file as JavaScript.
+
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        # Prevents your site from being embedded in an iframe on another site.
+        # Protects against clickjacking attacks.
+
+        add_header X-XSS-Protection "1; mode=block" always;
+        # Tells browser to block pages if it detects XSS attacks.
+
+        # --- Proxy Settings (apply to all locations below) ---
+        proxy_http_version 1.1;
+        # Use HTTP/1.1 for proxying (supports keep-alive to backend).
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # These headers tell your app:
+        #   - Host: what domain the user requested
+        #   - X-Real-IP: the actual client IP (not Nginx's IP)
+        #   - X-Forwarded-For: chain of proxy IPs
+        #   - X-Forwarded-Proto: http or https
+        # Without these, your app would see every request coming from Nginx's IP.
+
+
+        # --- Rate-limited routes ---
+
+        # Login and register — strict rate limit
+        location /api/auth/ {
+            limit_req zone=login burst=5 nodelay;
+            # zone=login = use the 3r/s limit defined above
+            # burst=5 = allow a burst of 5 requests above the rate, then enforce
+            # nodelay = don't queue burst requests, process them immediately
+            #   but once burst is used up, strictly enforce the rate
+
+            proxy_pass http://tinyscale_app;
+        }
+
+        # All other API routes — normal rate limit
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://tinyscale_app;
+        }
+
+        # Short URL redirects — normal rate limit
+        # This matches /:code (any path that isn't /api/ or other defined locations)
+        location / {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://tinyscale_app;
+        }
+
+        # Healthcheck — no rate limit (monitoring tools hit this frequently)
+        location /healthcheck {
+            proxy_pass http://tinyscale_app;
+        }
+
+        # --- Caching Headers for API responses ---
+        # Tell clients (browsers, CDNs) how long to cache responses.
+        location /api/stats/ {
+            proxy_pass http://tinyscale_app;
+            # Stats can be cached for 60 seconds — they don't change that fast
+            add_header Cache-Control "public, max-age=60" always;
+        }
+    }
+
+
+    # ---- SERVER BLOCK (HTTPS — port 443) ----
+    # This serves your app over HTTPS with a self-signed certificate.
+    # In production, you'd use Let's Encrypt (free, real certificates).
+    # Self-signed certs are for learning — browsers will show a warning.
+
+    server {
+        listen 443 ssl;
+        server_name localhost;
+
+        # SSL certificate and key (we'll generate these in Step 2)
+        ssl_certificate /etc/nginx/certs/selfsigned.crt;
+        ssl_certificate_key /etc/nginx/certs/selfsigned.key;
+
+        # Modern SSL settings
+        ssl_protocols TLSv1.2 TLSv1.3;
+        # Only allow TLS 1.2 and 1.3. Older versions (TLS 1.0, 1.1, SSL) have known vulnerabilities.
+
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        # Use strong ciphers only. Exclude NULL ciphers and MD5 (weak).
+
+        ssl_prefer_server_ciphers on;
+        # Server picks the cipher, not the client. Prevents client from choosing a weak cipher.
+
+        # Same proxy settings as HTTP
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Same security headers
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+
+        # HSTS — tells browser to ALWAYS use HTTPS for this domain
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        # For 1 year, browser won't even try HTTP — goes straight to HTTPS.
+        # Important in prod. Fine for learning here.
+
+        # Same locations as HTTP block
+        location /api/auth/ {
+            limit_req zone=login burst=5 nodelay;
+            proxy_pass http://tinyscale_app;
+        }
+
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://tinyscale_app;
+        }
+
+        location / {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://tinyscale_app;
+        }
+
+        location /healthcheck {
+            proxy_pass http://tinyscale_app;
+        }
+
+        location /api/stats/ {
+            proxy_pass http://tinyscale_app;
+            add_header Cache-Control "public, max-age=60" always;
+        }
+    }
+}
+
+--- END OF nginx/nginx.conf ---
+
+
+>> WHAT JUST HAPPENED IN THAT CONFIG? <<
+
+    1. HTTP on port 80 — unencrypted, for quick dev testing
+    2. HTTPS on port 443 — encrypted with self-signed cert
+    3. Gzip — compresses JSON responses (~80% smaller)
+    4. Rate limiting — 10 req/s for API, 3 req/s for auth (per IP)
+    5. Proxy pass — forwards everything to your app on port 3000
+    6. Security headers — basic protection against XSS, clickjacking
+    7. Cache headers — stats endpoint cacheable for 60 seconds
+    8. Upstream — defines your app backend (ready for load balancing later)
+
+
+================================================================================
+STEP 2: GENERATE SELF-SIGNED SSL CERTIFICATE
+================================================================================
+
+Create a folder for certificates:
+
+    mkdir nginx/certs
+
+Generate a self-signed certificate (run this in Git Bash):
+
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+      -keyout nginx/certs/selfsigned.key \
+      -out nginx/certs/selfsigned.crt \
+      -subj "/C=US/ST=Dev/L=Dev/O=TinyScale/CN=localhost"
+
+----- working command ------
+MSYS_NO_PATHCONV=1 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout nginx/certs/selfsigned.key \
+  -out nginx/certs/selfsigned.crt \
+  -subj "/C=US/ST=Dev/L=Dev/O=TinyScale/CN=localhost"
+
+
+Let's break that down:
+    -x509         = generate a self-signed certificate (not a signing request)
+    -nodes        = no password on the private key (fine for dev)
+    -days 365     = valid for 1 year
+    -newkey rsa:2048 = generate a new 2048-bit RSA key pair
+    -keyout       = where to save the private key
+    -out          = where to save the certificate
+    -subj         = certificate subject info (who are you?)
+
+If openssl isn't available in Git Bash, try running it in WSL2 or PowerShell.
+Alternatively, Docker can generate it for you:
+
+    docker run --rm -v "$(pwd)/nginx/certs:/certs" alpine/openssl \
+      req -x509 -nodes -days 365 -newkey rsa:2048 \
+      -keyout /certs/selfsigned.key \
+      -out /certs/selfsigned.crt \
+      -subj "/C=US/ST=Dev/L=Dev/O=TinyScale/CN=localhost"
+
+After running, you should have two files:
+    nginx/certs/selfsigned.key   (private key — NEVER share this)
+    nginx/certs/selfsigned.crt   (certificate — public, can share)
+
+>> WHAT IS SSL/TLS? (Quick version) <<
+
+    TLS (Transport Layer Security, successor to SSL) encrypts data between
+    client and server. Without it, anyone on the network can read your passwords,
+    tokens, and data in plain text.
+
+    The TLS handshake (simplified):
+    1. Client says: "I want to talk securely. Here are the ciphers I support."
+    2. Server says: "Let's use this cipher. Here's my certificate (proves identity)."
+    3. Client verifies certificate (is it signed by a trusted CA? is it expired?)
+       - Self-signed = NOT signed by a trusted CA → browser shows warning
+       - Let's Encrypt = signed by a trusted CA → browser shows padlock
+    4. Both sides agree on a session key (symmetric encryption)
+    5. All data is now encrypted with that session key
+
+    Self-signed certs are for dev/learning. Production uses Let's Encrypt (free, automated).
+
+
+================================================================================
+STEP 3: ADD NGINX TO DOCKER-COMPOSE
+================================================================================
+
+Open your docker-compose.yml and add the nginx service.
+
+Add this block to the `services:` section (AFTER the app service):
+
+  # ---- NGINX REVERSE PROXY ----
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - app
+    networks:
+      - tinyscale-network
+    restart: unless-stopped
+
+KEY THINGS TO UNDERSTAND:
+
+1. `image: nginx:alpine` — pre-built Nginx image (like Postgres, no Dockerfile needed)
+
+2. `ports: 80:80, 443:443` — Nginx listens on standard web ports.
+   Users connect to Nginx, NOT directly to your app anymore.
+
+3. `volumes:` (two of them, both read-only with :ro):
+   - `./nginx/nginx.conf:/etc/nginx/nginx.conf:ro`
+     Mounts your config file INTO the container. Nginx reads it on startup.
+     :ro = read-only — container can't modify your config.
+   - `./nginx/certs:/etc/nginx/certs:ro`
+     Mounts your SSL certificates into the container.
+
+4. `depends_on: app` — start Nginx after the app is running.
+   If Nginx starts and can't reach the app, it will show 502 Bad Gateway.
+
+5. We DON'T need `build:` because we're using a pre-built image.
+
+ALSO: Update the app service to REMOVE the direct port mapping.
+Your app should no longer be accessible directly — only through Nginx.
+
+Change the app service's ports from:
+    ports:
+      - "3000:3000"
+
+To:
+    expose:
+      - "3000"
+
+`expose` makes port 3000 available to OTHER CONTAINERS on the network,
+but NOT to the outside world (your host machine).
+Only Nginx (on ports 80/443) is accessible from outside.
+
+    BEFORE: User → :3000 → App (app exposed directly)
+    AFTER:  User → :80/:443 → Nginx → :3000 → App (app hidden behind Nginx)
+
+
+================================================================================
+STEP 4: UPDATE .dockerignore
+================================================================================
+
+Add the certificates to .dockerignore so they don't get baked into your app image:
+
+Open .dockerignore and add these lines at the end:
+    nginx
+
+Your .dockerignore should now look like:
+    node_modules
+    dist
+    .git
+    .env
+    *.md
+    tests
+    coverage
+    .vscode
+    nginx
+
+
+================================================================================
+STEP 5: RUN EVERYTHING WITH NGINX
+================================================================================
+
+    docker compose down
+    docker compose up --build
+
+Watch the logs. You should see:
+    1. db starts and becomes healthy
+    2. migrate runs and creates tables
+    3. app starts on port 3000
+    4. nginx starts on ports 80 and 443
+
+TEST HTTP (port 80):
+
+    curl http://localhost/healthcheck
+
+    Note: NO :3000 anymore! Port 80 is the default for HTTP, so you don't need to specify it.
+    This request goes: curl → Nginx:80 → App:3000 → response
+
+TEST HTTPS (port 443):
+
+    curl -k https://localhost/healthcheck
+
+    -k = skip certificate verification (because self-signed cert isn't trusted).
+    Without -k, curl will say "self-signed certificate" and refuse to connect.
+
+TEST THE FULL FLOW:
+
+    # Register
+    curl -X POST http://localhost/api/auth/register \
+      -H "Content-Type: application/json" \
+      -d '{"email":"nginx@test.com","password":"test1234"}'
+
+    # Login
+    curl -X POST http://localhost/api/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"email":"nginx@test.com","password":"test1234"}'
+
+    # Shorten (use your token)
+    curl -X POST http://localhost/api/shorten \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJkNjBhYjkxNi0zODg0LTQwNzItYjM4Mi1kNGUyOGY5MjU3YzUiLCJpYXQiOjE3NzQ4NDYyMTAsImV4cCI6MTc3NTQ1MTAxMH0.S-aCjNcz-CA_QAI5LylOzQ5dJhtFci0A9MN9F-kWZtI" \
+      -d '{"url":"https://www.google.com"}'
+
+VERIFY APP IS NOT DIRECTLY ACCESSIBLE:
+
+    curl http://localhost:3000/healthcheck
+
+    This should FAIL (connection refused) because port 3000 is no longer
+    mapped to the host. Only Nginx ports (80, 443) are accessible.
+    The app is hidden behind Nginx — exactly what we want.
+
+
+================================================================================
+STEP 6: SEE NGINX IN ACTION
+================================================================================
+
+1. CHECK GZIP IS WORKING:
+
+    curl -v -H "Accept-Encoding: gzip" http://localhost/healthcheck 2>&1 | grep -i content-encoding
+
+    You should see: Content-Encoding: gzip
+    This means the response was compressed before reaching you.
+
+    Without gzip header:
+    curl -v http://localhost/healthcheck 2>&1 | grep -i content-encoding
+    No Content-Encoding — Nginx sends uncompressed (client didn't ask for gzip).
+
+2. CHECK RATE LIMITING:
+
+    Test by hitting the auth endpoint rapidly. In bash, run:
+
+    for i in $(seq 1 10); do
+      echo "Request $i: $(curl -s -o /dev/null -w '%{http_code}' \
+        -X POST http://localhost/api/auth/register \
+        -H 'Content-Type: application/json' \
+        -d '{"email":"rate-test@test.com","password":"test1234"}')"
+    done
+
+    After a few requests, you should start seeing 503 (Service Temporarily Unavailable).
+    That's Nginx rejecting requests that exceed 3r/s for the auth endpoint.
+
+3. CHECK SECURITY HEADERS:
+
+    curl -v http://localhost/healthcheck 2>&1 | grep -i "x-content-type\|x-frame\|x-xss"
+
+    You should see:
+        X-Content-Type-Options: nosniff
+        X-Frame-Options: SAMEORIGIN
+        X-XSS-Protection: 1; mode=block
+
+4. CHECK NGINX LOGS:
+
+    docker compose logs nginx --tail 20
+
+    You'll see access logs with response times (rt=0.005 means 5ms).
+
+5. CHECK SSL DETAILS:
+
+    curl -kv https://localhost/healthcheck 2>&1 | grep -i "ssl\|subject\|issuer"
+
+    You'll see TLS version, cipher used, and your self-signed certificate subject.
+
+
+================================================================================
+STEP 7: EXPLORE AND UNDERSTAND
+================================================================================
+
+1. Go inside the Nginx container:
+       docker compose exec nginx sh
+   Inside:
+       cat /etc/nginx/nginx.conf    (your config file)
+       ls /etc/nginx/certs/         (your SSL certs)
+       nginx -t                     (test if config is valid)
+       exit
+
+2. What happens if the app crashes?
+       docker compose stop app      (stop just the app)
+       curl http://localhost/healthcheck
+       You'll get 502 Bad Gateway — Nginx is running but can't reach the app.
+       docker compose start app     (bring it back)
+       curl http://localhost/healthcheck    (works again)
+
+   This is important: Nginx stays up even if your app crashes.
+   Users see 502 instead of "connection refused" — a better experience.
+
+3. What happens if you change nginx.conf?
+       Edit nginx/nginx.conf (change rate from 10r/s to 5r/s for example)
+       docker compose restart nginx     (no --build needed — it's a mounted volume)
+       The change takes effect immediately!
+       This is the power of mounting config as a volume vs baking it into the image.
+
+
+================================================================================
+CHECKLIST BEFORE MOVING TO DAY 5-6
+================================================================================
+
+[ ] nginx/nginx.conf created with all sections (gzip, rate limit, proxy, SSL)
+[ ] Self-signed SSL certificates generated
+[ ] Nginx added to docker-compose.yml
+[ ] App port changed from `ports` to `expose` (no direct access)
+[ ] HTTP working: curl http://localhost/healthcheck
+[ ] HTTPS working: curl -k https://localhost/healthcheck
+[ ] Full API flow working through Nginx (register, login, shorten)
+[ ] Verified gzip compression works
+[ ] Verified rate limiting works (503 after burst)
+[ ] Verified security headers present
+[ ] Understand: reverse proxy, gzip, rate limiting, SSL/TLS, upstream
+[ ] Explored Nginx container (exec, logs, config)
+
+
+================================================================================
+================================================================================
+DAY 5-6: NETWORKING FUNDAMENTALS
+================================================================================
+================================================================================
+
+This is NOT about writing code. This is about UNDERSTANDING what happens
+when someone types a URL in the browser and presses Enter.
+
+Every engineer should be able to explain this. Interviewers love this question.
+
+
+================================================================================
+STEP 1: THE FULL JOURNEY OF A REQUEST
+================================================================================
+
+When someone visits http://localhost/Ax7bK2 (a short URL), here's EVERYTHING
+that happens. Read each step carefully.
+
+Step 1: DNS RESOLUTION (What IP is "localhost"?)
+───────────────────────────────────────────────
+    Browser asks: "What's the IP address of localhost?"
+    For localhost → it's always 127.0.0.1 (hardcoded in your OS)
+
+    For a real domain (like google.com):
+    1. Browser checks its DNS cache
+    2. If not cached → asks the OS DNS resolver
+    3. OS checks /etc/hosts (or Windows hosts file)
+    4. If not there → asks the configured DNS server (usually your router or 8.8.8.8)
+    5. DNS server may ask root servers → TLD servers → authoritative nameserver
+    6. Response: "google.com = 142.250.80.46"
+
+    TRY IT:
+        nslookup google.com
+        nslookup localhost
+
+    If you have `dig` available (WSL2 or install via Git Bash):
+        dig google.com
+        dig +short google.com       (just the IP)
+
+
+Step 2: TCP HANDSHAKE (Establish a connection)
+──────────────────────────────────────────────
+    Now the browser knows the IP. It needs to establish a connection.
+    TCP uses a 3-way handshake:
+
+    Client → Server: SYN (hey, I want to connect)
+    Server → Client: SYN-ACK (ok, I acknowledge, let's connect)
+    Client → Server: ACK (great, connection established)
+
+    This takes 1 round-trip time (RTT). For localhost it's microseconds.
+    For a server in another continent it could be 100-200ms.
+
+    WHY TCP? Because it's RELIABLE — packets arrive in order, lost packets
+    are retransmitted. HTTP needs this reliability. (UDP doesn't guarantee order.)
+
+
+Step 3: TLS HANDSHAKE (If HTTPS — encrypt the connection)
+──────────────────────────────────────────────────────────
+    If the URL is HTTPS, there's an additional handshake AFTER TCP:
+
+    Client → Server: "ClientHello" (TLS versions I support, ciphers I support)
+    Server → Client: "ServerHello" (chosen cipher) + Certificate (proves identity)
+    Client verifies certificate (is it trusted? is it expired? does domain match?)
+    Both sides compute session keys (using asymmetric crypto)
+    From now on, ALL data is encrypted with session keys (symmetric crypto)
+
+    This adds another 1-2 RTT. HTTPS is slower than HTTP by this overhead.
+    But the actual data transfer speed is the same (symmetric encryption is fast).
+
+    TRY IT:
+        curl -kv https://localhost/healthcheck 2>&1 | head -30
+
+    Look for:
+        * TLSv1.3 (OUT), TLS handshake, Client hello
+        * TLSv1.3 (IN), TLS handshake, Server hello
+        * SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+
+
+Step 4: HTTP REQUEST (Send the actual request)
+──────────────────────────────────────────────
+    Connection established. Browser sends the HTTP request:
+
+        GET /Ax7bK2 HTTP/1.1
+        Host: localhost
+        User-Agent: Mozilla/5.0 ...
+        Accept: */*
+
+    This is plain text (or encrypted if HTTPS). Method + path + headers.
+
+    TRY IT — see the full HTTP exchange:
+        curl -v http://localhost/healthcheck
+
+    The lines starting with > are what you SEND.
+    The lines starting with < are what you RECEIVE.
+
+
+Step 5: NGINX RECEIVES THE REQUEST
+───────────────────────────────────
+    Nginx on port 80 receives the request.
+
+    1. Checks rate limit → is this IP under 10r/s? If not, reject with 503.
+    2. Matches location → "/" matches the catch-all location block.
+    3. Forwards to upstream → proxy_pass http://tinyscale_app (your app on :3000)
+    4. Adds headers → X-Real-IP, X-Forwarded-For, etc.
+
+
+Step 6: YOUR APP PROCESSES THE REQUEST
+──────────────────────────────────────
+    Your Fastify app receives: GET /Ax7bK2
+
+    1. Route matching → /:code handler
+    2. Looks up Ax7bK2 in the database (or Redis cache in Week 3)
+    3. Found → responds with 302 redirect to the original URL
+    4. Logs the click (writes to clicks table)
+
+
+Step 7: RESPONSE TRAVELS BACK
+──────────────────────────────
+    App → Nginx → Client
+
+    HTTP/1.1 302 Found
+    Location: https://www.google.com
+
+    Nginx may:
+    - Gzip compress the response body
+    - Add security headers
+    - Add cache headers
+
+    Browser receives 302 → follows the Location header → makes a NEW request to google.com
+    (The whole cycle starts over for google.com!)
+
+
+FULL PICTURE:
+
+    User types URL
+        ↓
+    DNS lookup (localhost → 127.0.0.1)
+        ↓
+    TCP handshake (SYN → SYN-ACK → ACK)
+        ↓
+    [TLS handshake if HTTPS]
+        ↓
+    HTTP request → Nginx:80
+        ↓
+    Rate limit check → Location match → proxy_pass
+        ↓
+    App:3000 → Route match → DB query → Response
+        ↓
+    Nginx adds headers, compresses → Client
+        ↓
+    Browser follows redirect → new request to original URL
+
+
+================================================================================
+STEP 2: HANDS-ON — SEE IT ALL WITH CURL
+================================================================================
+
+RUN THESE COMMANDS and read the output carefully:
+
+1. VERBOSE HTTP REQUEST (see everything):
+
+    curl -v http://localhost/healthcheck
+
+    Read every line. You'll see:
+    - TCP connection established
+    - Request headers sent (>)
+    - Response headers received (<)
+    - Response body
+
+
+2. VERBOSE HTTPS REQUEST (see TLS handshake):
+
+    curl -kv https://localhost/healthcheck
+
+    Extra lines showing TLS negotiation.
+
+
+3. SEE RESPONSE HEADERS ONLY:
+
+    curl -I http://localhost/healthcheck
+
+    -I = HEAD request (only headers, no body)
+    Look for: X-Content-Type-Options, X-Frame-Options, Content-Type
+
+
+4. SEE A REDIRECT IN ACTION:
+
+    First create a short URL (if you haven't):
+        # Login and get token first, then:
+        curl -X POST http://localhost/api/shorten \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer YOUR_TOKEN" \
+          -d '{"url":"https://www.google.com"}'
+
+    Then follow the redirect verbosely:
+        curl -v http://localhost/YOUR_SHORT_CODE
+
+    You'll see the 302 and Location header. Add -L to follow it:
+        curl -vL http://localhost/YOUR_SHORT_CODE
+
+    Now you'll see TWO requests: one to your server, one to google.com.
+
+
+5. MEASURE TIMING:
+
+    curl -o /dev/null -s -w "\
+    DNS lookup:  %{time_namelookup}s\n\
+    TCP connect: %{time_connect}s\n\
+    TLS handshake: %{time_appconnect}s\n\
+    First byte:  %{time_starttransfer}s\n\
+    Total:       %{time_total}s\n" \
+    http://localhost/healthcheck
+
+    This shows you exactly how long each phase takes.
+    DNS + TCP should be near 0 for localhost.
+    First byte = time until server starts responding (your app's processing time).
+
+
+================================================================================
+STEP 3: HTTP/1.1 vs HTTP/2 — WHAT'S THE DIFFERENCE?
+================================================================================
+
+HTTP/1.1 (what we're using):
+    - Text-based protocol (headers are plain text)
+    - One request at a time per connection (head-of-line blocking)
+    - To load 10 images: browser opens ~6 parallel connections
+    - Keep-alive: reuse connection for multiple requests (but still one at a time)
+
+HTTP/2 (what modern sites use):
+    - Binary protocol (more efficient parsing)
+    - MULTIPLEXING: multiple requests on ONE connection simultaneously
+    - Header compression (HPACK): repeated headers aren't resent
+    - Server push: server can send resources before client asks
+    - Same connection, many parallel requests = faster page loads
+
+HTTP/3 (newest, growing adoption):
+    - Uses QUIC (UDP-based) instead of TCP
+    - Faster connection establishment (0-RTT possible)
+    - No head-of-line blocking at the transport level
+
+For our API (mostly single JSON requests), HTTP/1.1 vs HTTP/2 doesn't
+matter much. It matters more for web pages loading many resources.
+
+Nginx supports HTTP/2 for client connections. To enable it, you'd change:
+    listen 443 ssl;
+to:
+    listen 443 ssl http2;
+
+We won't do this now — just understand the concept.
+
+
+================================================================================
+STEP 4: CONNECTION POOLING AND KEEP-ALIVE
+================================================================================
+
+>> WHAT IS KEEP-ALIVE? <<
+
+Without keep-alive (HTTP/1.0 default):
+    Request 1: TCP handshake → Request → Response → Connection CLOSED
+    Request 2: TCP handshake → Request → Response → Connection CLOSED
+    Request 3: TCP handshake → Request → Response → Connection CLOSED
+    (3 handshakes = wasted time)
+
+With keep-alive (HTTP/1.1 default):
+    TCP handshake → Request 1 → Response 1 → Request 2 → Response 2 → ... → Connection CLOSED after timeout
+    (1 handshake, reused for many requests)
+
+Our Nginx config has: keepalive_timeout 65;
+This means the connection stays open for 65 seconds after the last request.
+
+>> WHAT IS CONNECTION POOLING? <<
+
+Your app connects to Postgres. Each query needs a connection.
+
+Without pooling:
+    Query 1: Open connection → Query → Close connection
+    Query 2: Open connection → Query → Close connection
+    (Opening a Postgres connection takes ~50ms — expensive!)
+
+With pooling:
+    App starts → Opens 10 connections → keeps them ready
+    Query 1: Grab connection from pool → Query → Return to pool
+    Query 2: Grab connection from pool → Query → Return to pool
+    (No connection overhead — queries start immediately)
+
+Your Drizzle/pg Pool already does this. Check it:
+    In your db plugin, the Pool object maintains a connection pool.
+    Default: min 0, max 10 connections.
+
+TRY IT — see active connections:
+    docker compose exec db psql -U dev tinyscale \
+      -c "SELECT count(*) FROM pg_stat_activity WHERE datname='tinyscale';"
+
+    This shows how many connections your app has open to Postgres.
+
+
+================================================================================
+CHECKLIST BEFORE MOVING TO DAY 7
+================================================================================
+
+[ ] Can explain the full request journey (DNS → TCP → TLS → HTTP → Nginx → App → DB → Response)
+[ ] Ran curl -v and understand each line of output
+[ ] Ran curl timing command and understand each phase
+[ ] Understand: keep-alive, connection pooling
+[ ] Understand: HTTP/1.1 vs HTTP/2 (conceptual, not config)
+[ ] Can explain to someone: "What happens when you type a URL in the browser?"
+
+
+================================================================================
+================================================================================
+DAY 7: LOAD TESTING WITH k6
+================================================================================
+================================================================================
+
+Now we break things on purpose. This is the fun part.
+
+k6 is a load testing tool. It simulates hundreds/thousands of users
+hitting your API simultaneously. You'll find where your system breaks.
+
+
+================================================================================
+STEP 1: INSTALL k6
+================================================================================
+
+Option A: Install directly on Windows (recommended)
+    Download from: https://dl.k6.io/msi/k6-latest-amd64.msi
+    Install it. Open a NEW terminal. Verify:
+        k6 version
+
+Option B: Use Docker (no install needed)
+    We'll run k6 from a Docker container. Works but slightly more complex.
+    We'll provide both commands below.
+
+Option C: Via Chocolatey (if you have it)
+    choco install k6
+
+
+================================================================================
+STEP 2: CREATE YOUR FIRST LOAD TEST
+================================================================================
+
+Create a folder for load tests:
+
+    mkdir load-tests
+
+Create the file `load-tests/basic.js`:
+
+--- START OF load-tests/basic.js ---
+
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate, Trend } from 'k6/metrics';
+
+// Custom metrics to track
+const errorRate = new Rate('errors');
+const redirectDuration = new Trend('redirect_duration');
+
+// ---- TEST CONFIGURATION ----
+// This defines HOW the load test runs.
+export const options = {
+  stages: [
+    // Ramp up: 0 → 50 users over 30 seconds
+    { duration: '30s', target: 50 },
+    // Stay at 50 users for 1 minute
+    { duration: '1m', target: 50 },
+    // Ramp up more: 50 → 100 users over 30 seconds
+    { duration: '30s', target: 100 },
+    // Stay at 100 users for 1 minute
+    { duration: '1m', target: 100 },
+    // Ramp down: 100 → 0 users over 30 seconds
+    { duration: '30s', target: 0 },
+  ],
+  // Thresholds — test FAILS if these aren't met
+  thresholds: {
+    http_req_duration: ['p(95)<500'],  // 95% of requests should complete in <500ms
+    errors: ['rate<0.1'],              // Error rate should be below 10%
+  },
+};
+
+const BASE_URL = 'http://nginx';
+// We use 'nginx' (the Docker service name) because k6 will run
+// inside the Docker network. If running k6 locally (not in Docker),
+// change this to 'http://localhost'.
+
+// ---- SETUP: Create test data ----
+// This runs ONCE before the test starts.
+export function setup() {
+  // Register a test user
+  const registerRes = http.post(
+    `${BASE_URL}/api/auth/register`,
+    JSON.stringify({
+      email: `loadtest-${Date.now()}@test.com`,
+      password: 'test1234',
+    }),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+
+  // Login to get a token
+  const loginRes = http.post(
+    `${BASE_URL}/api/auth/login`,
+    JSON.stringify({
+      email: `loadtest-${Date.now()}@test.com`,
+      password: 'test1234',
+    }),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+
+  // If login failed, try registering with the same email again
+  let token;
+  try {
+    token = JSON.parse(loginRes.body).token;
+  } catch (e) {
+    console.log('Login failed, trying fresh register...');
+    const email = `loadtest-${Date.now()}-retry@test.com`;
+    http.post(
+      `${BASE_URL}/api/auth/register`,
+      JSON.stringify({ email, password: 'test1234' }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    const retryLogin = http.post(
+      `${BASE_URL}/api/auth/login`,
+      JSON.stringify({ email, password: 'test1234' }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    token = JSON.parse(retryLogin.body).token;
+  }
+
+  // Create some short URLs to test redirects
+  const shortCodes = [];
+  for (let i = 0; i < 10; i++) {
+    const res = http.post(
+      `${BASE_URL}/api/shorten`,
+      JSON.stringify({ url: `https://example.com/page-${i}` }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    );
+    try {
+      const body = JSON.parse(res.body);
+      if (body.shortCode) {
+        shortCodes.push(body.shortCode);
+      }
+    } catch (e) {
+      console.log(`Failed to create short URL ${i}: ${res.status}`);
+    }
+  }
+
+  console.log(`Setup complete. Token obtained. ${shortCodes.length} short URLs created.`);
+  return { token, shortCodes };
+}
+
+// ---- MAIN TEST FUNCTION ----
+// This runs for EACH virtual user, repeatedly, for the duration of the test.
+export default function (data) {
+  const { token, shortCodes } = data;
+
+  // Scenario 1: Create a short URL (write operation)
+  if (Math.random() < 0.2) {
+    // 20% of requests are writes (creating new short URLs)
+    const res = http.post(
+      `${BASE_URL}/api/shorten`,
+      JSON.stringify({
+        url: `https://example.com/loadtest-${Date.now()}-${Math.random()}`,
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    );
+
+    const success = check(res, {
+      'shorten: status 201': (r) => r.status === 201,
+      'shorten: has shortCode': (r) => {
+        try { return JSON.parse(r.body).shortCode !== undefined; }
+        catch { return false; }
+      },
+    });
+    errorRate.add(!success);
+  }
+
+  // Scenario 2: Redirect (read operation — the HOT PATH)
+  if (shortCodes.length > 0 && Math.random() < 0.7) {
+    // 70% of requests are redirects (the most common operation)
+    const code = shortCodes[Math.floor(Math.random() * shortCodes.length)];
+    const res = http.get(`${BASE_URL}/${code}`, {
+      redirects: 0, // Don't follow redirect — we just want to measure our server
+    });
+
+    const success = check(res, {
+      'redirect: status 302': (r) => r.status === 302,
+      'redirect: has Location': (r) => r.headers['Location'] !== undefined,
+    });
+    errorRate.add(!success);
+    redirectDuration.add(res.timings.duration);
+  }
+
+  // Scenario 3: Get stats (analytics query)
+  if (shortCodes.length > 0 && Math.random() < 0.1) {
+    // 10% of requests are stats lookups
+    const code = shortCodes[Math.floor(Math.random() * shortCodes.length)];
+    const res = http.get(`${BASE_URL}/api/stats/${code}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const success = check(res, {
+      'stats: status 200': (r) => r.status === 200,
+    });
+    errorRate.add(!success);
+  }
+
+  // Wait 0.5-1.5 seconds between requests (simulate real user think time)
+  sleep(Math.random() + 0.5);
+}
+
+--- END OF load-tests/basic.js ---
+
+
+>> WHAT DOES THIS TEST DO? <<
+
+    It simulates realistic traffic:
+    - 20% writes (creating short URLs) — like real users shortening URLs
+    - 70% redirects (clicking short URLs) — the most common operation
+    - 10% analytics queries — checking stats
+
+    It ramps up gradually:
+    - 0 → 50 users (warm up)
+    - Hold at 50 (stable load)
+    - 50 → 100 users (stress test)
+    - Hold at 100 (sustained stress)
+    - 100 → 0 (cool down)
+
+    Total test duration: ~3.5 minutes
+
+
+================================================================================
+STEP 3: RUN THE LOAD TEST
+================================================================================
+
+Make sure your app is running:
+    docker compose up -d
+    (-d = detached mode, runs in background so you can use the terminal)
+
+Verify it's up:
+    curl http://localhost/healthcheck
+
+
+OPTION A: k6 installed locally
+    NOTE: When running locally, k6 can't resolve Docker service names.
+    You need to change BASE_URL in the test file.
+
+    Open load-tests/basic.js and change:
+        const BASE_URL = 'http://nginx';
+    To:
+        const BASE_URL = 'http://localhost';
+
+    Then run:
+        k6 run load-tests/basic.js
+
+
+OPTION B: Run k6 inside Docker (on the same network)
+    This way k6 can use Docker service names (nginx, app, etc.)
+    No need to change BASE_URL.
+
+    docker run --rm -i --network tinyscale_tinyscale-network \
+      grafana/k6 run - < load-tests/basic.js
+
+    NOTE: The network name might be slightly different. Check with:
+        docker network ls
+    Look for something like "tinyscale_tinyscale-network" or "tinyscale-network".
+
+
+WATCH IT RUN:
+    k6 shows real-time stats:
+    - running: how many virtual users active
+    - http_reqs: total requests sent
+    - http_req_duration: response time (avg, p90, p95)
+    - errors: error rate
+
+    While k6 runs, open another terminal and watch your system:
+
+    docker compose logs -f app        (app logs — watch for errors)
+    docker stats                       (CPU/RAM usage per container)
+
+
+================================================================================
+STEP 4: READ THE RESULTS
+================================================================================
+
+After the test finishes, k6 prints a summary. Here's what to look for:
+
+    http_req_duration:
+        avg = average response time
+        p(90) = 90% of requests were faster than this
+        p(95) = 95% of requests were faster than this (your threshold)
+        max = slowest single request
+
+    http_reqs:
+        count = total requests sent
+        rate = requests per second
+
+    errors:
+        rate = what percentage of requests failed
+
+    redirect_duration:
+        This is your custom metric — how long redirects take specifically.
+
+WHAT'S GOOD?
+    - p(95) < 100ms for redirects = excellent
+    - p(95) < 500ms for API calls = good
+    - Error rate < 1% = solid
+    - If you hit > 500 req/s without errors = impressive for local Docker
+
+WHAT'S BAD?
+    - p(95) > 1 second = something is bottlenecked
+    - Error rate > 10% = system is breaking under load
+    - Requests timing out = your app or DB can't keep up
+
+
+================================================================================
+STEP 5: FIND THE BOTTLENECK
+================================================================================
+
+The whole point of load testing is to find WHERE your system breaks.
+
+RUN THESE WHILE THE LOAD TEST IS RUNNING:
+
+1. CONTAINER RESOURCE USAGE:
+       docker stats
+
+   Look at:
+   - CPU %: Is any container at 100%?
+   - MEM USAGE: Is anything running out of memory?
+   - If app is at 100% CPU → Node.js is the bottleneck (single-threaded)
+   - If db is at high CPU → queries are slow (need indexes or caching)
+
+2. DATABASE CONNECTIONS:
+       docker compose exec db psql -U dev tinyscale \
+         -c "SELECT count(*) FROM pg_stat_activity WHERE datname='tinyscale';"
+
+   If this is at the connection pool max (usually 10), DB connections are the bottleneck.
+
+3. SLOW QUERIES:
+       docker compose exec db psql -U dev tinyscale \
+         -c "SELECT query, calls, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 5;"
+
+   If pg_stat_statements isn't enabled, check the app logs for slow request times.
+
+4. NGINX RATE LIMITING:
+       docker compose logs nginx 2>&1 | grep "limiting"
+
+   If you see a lot of "limiting requests" messages, Nginx rate limiting
+   might be rejecting legitimate test traffic. You may need to increase
+   the rate limits in nginx.conf for load testing.
+
+   NOTE: For load testing, you can temporarily increase limits:
+       rate=100r/s and burst=200
+   Then restart nginx: docker compose restart nginx
+
+
+================================================================================
+STEP 6: WRITE DOWN YOUR FINDINGS
+================================================================================
+
+Create a file: load-tests/results.md
+
+Write down:
+    1. What load did you test? (max users, duration)
+    2. What was the peak requests/second?
+    3. What was p(95) response time?
+    4. What was the error rate?
+    5. WHERE was the bottleneck? (app CPU, DB connections, Nginx rate limit?)
+    6. What would you do to fix it?
+
+Example:
+    # Load Test Results — Day 7
+
+    ## Setup
+    - Ramp: 0 → 50 → 100 users over 3.5 minutes
+    - Traffic mix: 20% writes, 70% redirects, 10% stats
+
+    ## Results
+    - Peak: ~150 req/s
+    - p(95) response time: 230ms
+    - Error rate: 3.2% (mostly Nginx rate limiting)
+
+    ## Bottleneck
+    - App container CPU at 95% during peak load
+    - Node.js single-threaded — can't use multiple CPU cores
+
+    ## Next Steps (Week 3)
+    - Add Redis caching for redirects (avoid DB hit on every redirect)
+    - Move click tracking to background jobs (async write)
+
+THESE NUMBERS GO ON YOUR RESUME. "Tested at 150 req/s, identified CPU bottleneck,
+improved to 5000 req/s with Redis caching" — this is what gets interviews.
+
+
+================================================================================
+FINAL CHECKLIST — WEEK 2 COMPLETE
+================================================================================
+
+DAY 1-2 (Docker):
+[x] Dockerfile with multi-stage build
+[x] docker-compose.yml with app + postgres + migration
+[x] Understand: images vs containers, volumes, networks, layer caching
+
+DAY 3-4 (Nginx):
+[ ] nginx.conf with proxy, gzip, rate limiting, SSL
+[ ] Self-signed SSL certificates
+[ ] App accessible only through Nginx (port 80/443)
+[ ] Understand: reverse proxy, TLS, security headers
+
+DAY 5-6 (Networking):
+[ ] Can explain the full request journey
+[ ] Used curl -v to see HTTP headers and TLS handshake
+[ ] Understand: DNS, TCP handshake, TLS, HTTP, keep-alive, connection pooling
+
+DAY 7 (Load Testing):
+[ ] k6 installed and load test script written
+[ ] Ran load test against Nginx → App → DB
+[ ] Found at least one bottleneck
+[ ] Results documented with numbers
+
+>> WEEK 2 CHECKPOINT: <<
+Your app runs in Docker behind Nginx. You've load-tested it and found
+at least one bottleneck. You understand what happens between "user types URL"
+and "your code runs."
+
+When done, message: "Week 2 done, ready for Week 3"
+Week 3: Redis + Caching + Background Jobs — this is where you make it FAST.
+================================================================================

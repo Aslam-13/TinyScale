@@ -1,0 +1,78 @@
+{
+  "timestamp": "2026-03-30T08:54:11.111Z",
+  "metrics": {
+    "http_reqs": {
+      "count": 13380,
+      "rate": 63.07124059818865
+    },
+    "http_req_duration": {
+      "p(95)": 15.863624999999999,
+      "avg": 9.138703849028385,
+      "min": 1.8498,
+      "med": 5.8299,
+      "max": 911.1463,
+      "p(90)": 11.829950000000004
+    },
+    "http_req_failed": {
+      "rate": 0,
+      "passes": 0,
+      "fails": 13380
+    },
+    "errors": {
+      "fails": 13368,
+      "rate": 0,
+      "passes": 0
+    },
+    "redirect_duration": {
+      "avg": 7.129579782171939,
+      "min": 1.8498,
+      "med": 4.7505,
+      "max": 900.94,
+      "p(90)": 8.353,
+      "p(95)": 10.489939999999995
+    }
+  },
+  "checks": {
+    "total": 25443,
+    "passes": 25443,
+    "fails": 0,
+    "passRate": "100.00%"
+  }
+}
+
+
+// reate limit only didn't applied forogt re run containers with new images
+
+
+{
+
+//   INFO[0001] Setup complete. Token obtained. 10 short URLs created.  source=console
+//      ✓ redirect: status 302
+//      ✓ redirect: has Location
+//      ✓ stats: status 200
+//      ✓ shorten: status 201
+//      ✓ shorten: has shortCode
+
+//      checks.........................: 100.00% ✓ 25443     ✗ 0
+//      data_received..................: 5.4 MB  26 kB/s
+//      data_sent......................: 2.2 MB  10 kB/s
+//    ✓ errors.........................: 0.00%   ✓ 0         ✗ 13368
+//      http_req_blocked...............: avg=15.99µs  min=0s       med=0s     max=3.95ms   p(90)=0s      p(95)=0s
+//      http_req_connecting............: avg=9.96µs   min=0s       med=0s     max=3.95ms   p(90)=0s      p(95)=0s
+//    ✓ http_req_duration..............: avg=9.13ms   min=1.84ms   med=5.82ms max=911.14ms p(90)=11.82ms p(95)=15.86ms
+//        { expected_response:true }...: avg=9.13ms   min=1.84ms   med=5.82ms max=911.14ms p(90)=11.82ms p(95)=15.86ms
+//      http_req_failed................: 0.00%   ✓ 0         ✗ 13380
+//      http_req_receiving.............: avg=139.02µs min=0s       med=0s     max=3.45ms   p(90)=582.3µs p(95)=630.7µs
+//      http_req_sending...............: avg=25.71µs  min=0s       med=0s     max=8.75ms   p(90)=0s      p(95)=0s
+//      http_req_tls_handshaking.......: avg=0s       min=0s       med=0s     max=0s       p(90)=0s      p(95)=0s
+//      http_req_waiting...............: avg=8.97ms   min=1.63ms   med=5.66ms max=910.57ms p(90)=11.6ms  p(95)=15.63ms
+//      http_reqs......................: 13380   63.071241/s
+//      iteration_duration.............: avg=1s       min=500.32ms med=1s     max=2.4s     p(90)=1.4s    p(95)=1.45s
+//      iterations.....................: 13496   63.618047/s
+//      redirect_duration..............: avg=7.12958  min=1.8498   med=4.7505 max=900.94   p(90)=8.353   p(95)=10.48994
+//      vus............................: 1       min=0       max=100
+
+// running (3m32.1s), 000/100 VUs, 13496 complete and 0 interrupted iterations
+// default ✓ [======================================] 000/100 VUs  3m30s
+
+}

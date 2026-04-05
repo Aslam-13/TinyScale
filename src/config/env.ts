@@ -13,6 +13,7 @@ function requireEnv(key: string): string {
 export const env = {
   DATABASE_URL: requireEnv("DATABASE_URL"),
   JWT_SECRET: requireEnv("JWT_SECRET"),
+  REDIS_URL: process.env["REDIS_URL"] ?? "redis://localhost:6379",
   PORT: parseInt(process.env["PORT"] ?? "3000", 10),
   HOST: process.env["HOST"] ?? "0.0.0.0",
   NODE_ENV: process.env["NODE_ENV"] ?? "development",

@@ -1,0 +1,2587 @@
+================================================================================
+                    WEEK 3: REDIS + CACHING + BACKGROUND JOBS
+                    ==========================================
+                    Your Goal: Understand why caching exists,
+                    implement it properly, and move expensive
+                    work to background jobs.
+================================================================================
+
+
+================================================================================
+DAY 1-2: REDIS FUNDAMENTALS
+================================================================================
+
+BEFORE YOU TOUCH ANY COMMANDS - READ AND UNDERSTAND THIS:
+----------------------------------------------------------
+
+>> WHAT IS REDIS? <<
+
+Redis = Remote Dictionary Server. It's an IN-MEMORY data store.
+
+Think about your current TinyScale flow when someone clicks a short URL:
+
+    User clicks short URL
+        ↓
+    Nginx → App → Query Postgres (disk I/O) → Return redirect
+        ↓
+    ~5-20ms for the DB query alone
+
+Now imagine if the short_code → original_url mapping was already in memory:
+
+    User clicks short URL
+        ↓
+    Nginx → App → Check Redis (in-memory) → Return redirect
+        ↓
+    ~0.1-0.5ms for the Redis lookup
+
+That's 10-100x faster. That's why Redis exists.
+
+>> BUT WHY NOT JUST USE A JavaScript OBJECT/MAP? <<
+
+Good question. You COULD cache in a JS Map:
+
+    const cache = new Map();
+    cache.set("Ax7bK2", "https://google.com");
+
+Problems:
+1. MEMORY LIMIT: Your Node.js process has limited heap memory (~1.5GB default).
+   Redis can use as much RAM as your server has.
+
+2. PROCESS RESTART: When your app restarts, the Map is gone.
+   Redis persists data (optional) and survives app restarts.
+
+3. MULTIPLE APP INSTANCES: In Week 7, you'll run 3 replicas of your app.
+   Each has its own Map — they can't share cache.
+   Redis is a SEPARATE service — all app instances share it.
+
+4. DATA STRUCTURES: Redis has sorted sets, lists, hashes, streams, pub/sub.
+   A JS Map is just key-value. Redis is a data structure server.
+
+5. TTL (TIME TO LIVE): Redis can auto-expire keys. With a Map, you'd have
+   to implement your own expiration logic.
+
+>> WHY IS REDIS FAST IF IT'S JUST ANOTHER SERVER? <<
+
+Redis is fast because:
+1. IN-MEMORY: All data lives in RAM. No disk I/O for reads.
+   RAM access: ~100 nanoseconds. Disk access: ~10 milliseconds. That's 100,000x faster.
+
+2. SINGLE-THREADED: No locking, no context switching, no race conditions.
+   "Wait, single-threaded = slow?" — No. Redis is I/O-bound, not CPU-bound.
+   It uses an event loop (like Node.js!) to handle thousands of connections.
+
+3. EFFICIENT PROTOCOLS: Redis uses a simple text protocol (RESP).
+   Minimal parsing overhead compared to SQL.
+
+4. OPTIMIZED DATA STRUCTURES: Redis's internal implementations
+   (skip lists, hash tables, ziplist) are highly optimized for memory and speed.
+
+>> HOW IS REDIS DIFFERENT FROM POSTGRES? <<
+
+    Postgres                            Redis
+    ───────                             ─────
+    Stores on DISK (durable)            Stores in MEMORY (fast)
+    Complex queries (JOIN, GROUP BY)    Simple key-value operations
+    ACID transactions                   Atomic single-command operations
+    Best for: source of truth           Best for: cache, sessions, counters
+    Handles 1K-10K queries/sec          Handles 100K+ operations/sec
+    Data survives power loss            Data LOST on restart (unless configured)
+
+RULE: Postgres is your source of truth. Redis is your speed layer.
+If Redis dies, your app should still work — just slower.
+
+
+================================================================================
+STEP 1: ADD REDIS TO DOCKER-COMPOSE
+================================================================================
+
+Open your docker-compose.yml and add the Redis service.
+
+Add this block to the `services:` section (after the db service):
+
+  # ---- REDIS ----
+  redis:
+    image: redis:7-alpine
+    # Redis 7 on Alpine Linux — small and fast
+    ports:
+      - "6379:6379"
+      # 6379 is Redis's default port
+      # Mapping to host so you can use redis-cli from your machine
+    volumes:
+      - redisdata:/data
+      # Redis can persist data to disk (RDB snapshots / AOF log)
+      # /data is where Redis saves its dump.rdb file
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      # redis-cli ping should return PONG if Redis is healthy
+    networks:
+      - tinyscale-network
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    # --maxmemory 128mb = limit Redis to 128MB of RAM
+    #   In production, you'd set this higher based on your server.
+    #   For local dev, 128MB is plenty.
+    # --maxmemory-policy allkeys-lru = when Redis is full, evict Least Recently Used keys
+    #   Other policies:
+    #     volatile-lru = evict only keys WITH an expire set
+    #     allkeys-random = evict random keys
+    #     noeviction = return errors when memory is full (dangerous!)
+    #   LRU is the safest default for a cache.
+
+Also add `redisdata` to the volumes section at the bottom:
+
+volumes:
+  pgdata:
+  redisdata:
+    # Persists Redis data between container restarts
+    # Not strictly necessary for a cache (it's expendable)
+    # but useful so you don't lose data during docker-compose restart
+
+Now update your `app` service to depend on Redis:
+
+  app:
+    # ... existing config ...
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+      JWT_SECRET: docker-dev-secret-change-in-production
+      REDIS_URL: redis://redis:6379
+      PORT: 3000
+      HOST: 0.0.0.0
+      NODE_ENV: production
+
+KEY THINGS TO UNDERSTAND:
+
+1. `redis://redis:6379` — The hostname `redis` is the service name in docker-compose.
+   Docker DNS resolves it to the Redis container's IP, just like `db` for Postgres.
+
+2. `--maxmemory-policy allkeys-lru` — This is CRITICAL for a cache.
+   Without it, Redis fills up and returns errors. With LRU, old cached data
+   is automatically evicted to make room for new data.
+
+3. Redis image is already configured for production use. Unlike Postgres,
+   there's no user/password by default. In production, you'd add:
+     command: redis-server --requirepass yourpassword
+   For local dev, no password is fine.
+
+
+================================================================================
+STEP 2: START REDIS AND EXPLORE WITH redis-cli
+================================================================================
+
+Bring everything up:
+
+    docker compose up -d redis
+
+Verify Redis is running:
+
+    docker compose ps
+
+You should see the redis container as "healthy".
+
+Now connect with redis-cli:
+
+    docker compose exec redis redis-cli
+
+You're now inside the Redis CLI. Let's explore every data structure you'll use.
+
+
+>> STRINGS (the basic key-value) <<
+
+    SET greeting "hello world"
+    GET greeting
+    # Returns: "hello world"
+
+    SET counter 0
+    INCR counter
+    INCR counter
+    INCR counter
+    GET counter
+    # Returns: "3"
+    # INCR is ATOMIC — safe even with concurrent access
+
+    SET mykey "expires soon" EX 10
+    # EX 10 = expires in 10 seconds
+    TTL mykey
+    # Returns: seconds remaining (e.g., 8)
+    # Wait 10 seconds...
+    GET mykey
+    # Returns: (nil) — it's gone!
+
+    # This is how we'll cache URL lookups:
+    SET "url:Ax7bK2" "https://google.com" EX 3600
+    # Cache short code → URL for 1 hour (3600 seconds)
+    GET "url:Ax7bK2"
+    # Returns: "https://google.com"
+
+WHY THIS MATTERS FOR TINYSCALE:
+    Every redirect does: SELECT * FROM urls WHERE short_code = 'Ax7bK2'
+    With Redis: GET "url:Ax7bK2" — 100x faster, zero DB load.
+
+
+>> HASHES (like a JavaScript object) <<
+
+    HSET user:123 name "Aslam" email "aslam@test.com" role "admin"
+    HGET user:123 name
+    # Returns: "Aslam"
+
+    HGETALL user:123
+    # Returns: name "Aslam" email "aslam@test.com" role "admin"
+
+    HINCRBY user:123 loginCount 1
+    # Increments the loginCount field by 1
+
+WHY THIS MATTERS:
+    Sessions, user profiles, caching objects with multiple fields.
+    Instead of serializing/deserializing JSON, access individual fields.
+
+
+>> LISTS (ordered, like an array) <<
+
+    LPUSH queue:clicks "click-event-1"
+    LPUSH queue:clicks "click-event-2"
+    LPUSH queue:clicks "click-event-3"
+    # LPUSH = push to LEFT (front) of list
+
+    LRANGE queue:clicks 0 -1
+    # Returns all elements (0 to -1 means start to end)
+
+    RPOP queue:clicks
+    # Returns and removes from RIGHT (end) — "click-event-1"
+    # This is FIFO queue behavior: LPUSH + RPOP
+
+WHY THIS MATTERS:
+    BullMQ uses Redis lists (and streams) as its job queue.
+    Jobs are pushed in, workers pop them out.
+
+
+>> SETS (unique values, no duplicates) <<
+
+    SADD active:users "user-1" "user-2" "user-3" "user-1"
+    SMEMBERS active:users
+    # Returns: "user-1" "user-2" "user-3" (no duplicate user-1)
+
+    SISMEMBER active:users "user-2"
+    # Returns: 1 (true) — O(1) lookup!
+
+    SCARD active:users
+    # Returns: 3 (count of members)
+
+WHY THIS MATTERS:
+    Tracking unique visitors, deduplication, feature flags.
+
+
+>> SORTED SETS (ranked data) <<
+
+    ZADD leaderboard 100 "url-abc" 250 "url-def" 50 "url-ghi"
+    # ZADD key score member — each member has a score
+
+    ZRANGE leaderboard 0 -1 WITHSCORES
+    # Returns sorted by score (ascending): ghi(50), abc(100), def(250)
+
+    ZREVRANGE leaderboard 0 2 WITHSCORES
+    # Returns top 3 by score (descending): def(250), abc(100), ghi(50)
+
+    ZINCRBY leaderboard 1 "url-abc"
+    # Increment url-abc's score by 1 (now 101)
+
+WHY THIS MATTERS:
+    Real-time click counters! Every click: ZINCRBY leaderboard 1 "url-abc"
+    Get top 10 most clicked URLs: ZREVRANGE leaderboard 0 9 WITHSCORES
+    No database query needed. Updated in real-time.
+
+
+>> KEY EXPIRATION AND TTL <<
+
+    SET temp "I disappear" EX 30
+    TTL temp
+    # Returns: 30 (seconds remaining)
+
+    PERSIST temp
+    # Removes expiration — key lives forever now
+
+    EXPIRE temp 60
+    # Set expiration on existing key — 60 seconds
+
+    PTTL temp
+    # TTL in milliseconds (more precise)
+
+WHY THIS MATTERS:
+    Cache invalidation! Set TTL on cached URL lookups.
+    After TTL expires, next request hits Postgres and re-caches.
+    This prevents stale data from living forever.
+
+
+>> USEFUL COMMANDS <<
+
+    KEYS *
+    # List ALL keys (DON'T use in production — scans entire DB)
+    # Use SCAN instead for production
+
+    DBSIZE
+    # How many keys exist
+
+    INFO memory
+    # How much memory Redis is using
+
+    FLUSHALL
+    # Delete EVERYTHING (careful!)
+
+    TYPE mykey
+    # What data type is this key? (string, list, set, hash, zset)
+
+    EXIT
+    # Leave redis-cli
+
+
+================================================================================
+STEP 3: INSTALL REDIS CLIENT FOR NODE.JS
+================================================================================
+
+You need a Node.js library to talk to Redis. We'll use `ioredis` — it's the
+most popular, feature-rich Redis client for Node.js.
+
+Run this in the TinyScale root:
+
+    npm install ioredis
+
+And the types:
+
+    npm install -D @types/ioredis
+
+>> WHY ioredis AND NOT redis (the official client)? <<
+
+    ioredis:
+    - Better TypeScript support
+    - Built-in cluster support
+    - Built-in Sentinel support (high availability)
+    - Automatic reconnection
+    - Pipeline and transaction support
+    - Used by BullMQ (which we'll add in Day 5-6)
+
+    The official `redis` package (v4+) is also good, but ioredis is
+    the de facto standard in the Node.js ecosystem.
+
+
+================================================================================
+STEP 4: UPDATE ENVIRONMENT CONFIG
+================================================================================
+
+Open src/config/env.ts and add REDIS_URL:
+
+--- MODIFY src/config/env.ts to look like this ---
+
+import dotenv from "dotenv";
+
+dotenv.config();
+
+function requireEnv(key: string): string {
+  const value = process.env[key];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${key}`);
+  }
+  return value;
+}
+
+export const env = {
+  DATABASE_URL: requireEnv("DATABASE_URL"),
+  JWT_SECRET: requireEnv("JWT_SECRET"),
+  REDIS_URL: process.env["REDIS_URL"] ?? "redis://localhost:6379",
+  PORT: parseInt(process.env["PORT"] ?? "3000", 10),
+  HOST: process.env["HOST"] ?? "0.0.0.0",
+  NODE_ENV: process.env["NODE_ENV"] ?? "development",
+} as const;
+
+--- END OF MODIFICATION ---
+
+NOTE: REDIS_URL is NOT required (has a default). This is intentional.
+If Redis isn't available, your app should still work — just without caching.
+This is called "graceful degradation."
+
+Also update your .env file for local development:
+
+    DATABASE_URL=postgres://dev:dev@localhost:5432/tinyscale
+    JWT_SECRET=super-secret-dev-key-change-in-production
+    REDIS_URL=redis://localhost:6379
+    PORT=3000
+    HOST=0.0.0.0
+
+
+================================================================================
+STEP 5: CREATE THE REDIS PLUGIN
+================================================================================
+
+Create a new file: src/plugins/redis.plugin.ts
+
+--- START OF src/plugins/redis.plugin.ts ---
+
+import fp from "fastify-plugin";
+import { type FastifyInstance } from "fastify";
+import Redis from "ioredis";
+import { env } from "../config/env.js";
+
+// Extend Fastify's type system so app.redis is available everywhere
+declare module "fastify" {
+  interface FastifyInstance {
+    redis: Redis;
+  }
+}
+
+export const redisPlugin = fp(async (fastify: FastifyInstance) => {
+  const redis = new Redis(env.REDIS_URL, {
+    // Connection settings
+    maxRetriesPerRequest: 3,
+    // If Redis is unreachable, retry 3 times before giving up on that request.
+    // BullMQ requires this to be null (we'll handle that separately in Day 5-6).
+
+    retryStrategy(times) {
+      // How long to wait before reconnecting after disconnect
+      const delay = Math.min(times * 200, 5000);
+      // First retry: 200ms, second: 400ms, ... max: 5000ms
+      fastify.log.warn(`Redis reconnecting... attempt ${times}, delay ${delay}ms`);
+      return delay;
+    },
+
+    // When Redis connects/disconnects, log it
+    lazyConnect: false,
+    // lazyConnect: false = connect immediately when created
+    // lazyConnect: true = connect on first command (useful for optional Redis)
+  });
+
+  // Log connection events
+  redis.on("connect", () => {
+    fastify.log.info("Redis connected");
+  });
+
+  redis.on("error", (err) => {
+    fastify.log.error(err, "Redis connection error");
+    // DON'T throw — let the app continue without Redis (graceful degradation)
+  });
+
+  redis.on("close", () => {
+    fastify.log.warn("Redis connection closed");
+  });
+
+  // Decorate Fastify with the Redis client
+  fastify.decorate("redis", redis);
+
+  // Clean up on app shutdown
+  fastify.addHook("onClose", async () => {
+    fastify.log.info("Closing Redis connection");
+    await redis.quit();
+    // redis.quit() sends QUIT command — graceful disconnect
+    // redis.disconnect() is forceful — don't use unless necessary
+  });
+});
+
+--- END OF src/plugins/redis.plugin.ts ---
+
+
+>> WHAT JUST HAPPENED? <<
+
+1. We created a Fastify plugin (just like db.plugin.ts and auth.plugin.ts)
+2. It creates an ioredis client connected to REDIS_URL
+3. It decorates the Fastify instance so you can use `app.redis` anywhere
+4. It logs connection events (connect, error, close)
+5. It gracefully disconnects when the app shuts down
+6. It retries connection with exponential backoff if Redis goes down
+
+The pattern is identical to your db.plugin.ts — same approach, different service.
+
+
+================================================================================
+STEP 6: REGISTER THE REDIS PLUGIN IN YOUR APP
+================================================================================
+
+Open src/app.ts and register the Redis plugin.
+
+--- MODIFY src/app.ts ---
+
+Add the import at the top (with the other plugin imports):
+
+    import { redisPlugin } from "./plugins/redis.plugin.js";
+
+Then register it AFTER dbPlugin and BEFORE rateLimitPlugin:
+
+    // Plugins (order matters)
+    await app.register(dbPlugin);
+    await app.register(redisPlugin);    // ← ADD THIS LINE
+    await app.register(authPlugin);
+    await app.register(rateLimitPlugin);
+
+--- END OF MODIFICATION ---
+
+WHY THIS ORDER?
+    dbPlugin first (other plugins might need DB)
+    redisPlugin second (rate limiting and caching will use Redis)
+    authPlugin third (JWT setup)
+    rateLimitPlugin last (might use Redis for distributed rate limiting later)
+
+
+================================================================================
+STEP 7: TEST THE REDIS CONNECTION
+================================================================================
+
+Update the healthcheck to include Redis status.
+
+Open src/app.ts and modify the healthcheck:
+
+--- MODIFY the healthcheck in src/app.ts ---
+
+Change this:
+    app.get("/healthcheck", async () => {
+      return { status: "ok" };
+    });
+
+To this:
+    app.get("/healthcheck", async (request) => {
+      // Check Redis connectivity
+      let redisStatus = "disconnected";
+      try {
+        const pong = await request.server.redis.ping();
+        redisStatus = pong === "PONG" ? "connected" : "error";
+      } catch {
+        redisStatus = "error";
+      }
+
+      return {
+        status: "ok",
+        redis: redisStatus,
+      };
+    });
+
+--- END OF MODIFICATION ---
+
+Now test it:
+
+    docker compose up --build
+
+Then:
+
+    curl http://localhost/healthcheck
+
+You should see:
+
+    {"status":"ok","redis":"connected"}
+
+If redis shows "error", check:
+    - Is the Redis container running? docker compose ps
+    - Is REDIS_URL set correctly in docker-compose.yml?
+    - Check logs: docker compose logs redis
+
+
+================================================================================
+STEP 8: EXPLORE REDIS WITH YOUR APP
+================================================================================
+
+While everything is running, verify Redis is working:
+
+1. Go inside the Redis container:
+       docker compose exec redis redis-cli
+
+   Check if Redis is empty:
+       DBSIZE
+       # Should return 0 (no keys yet — we haven't cached anything)
+
+       INFO memory
+       # Shows memory usage — should be very low (~1MB baseline)
+
+       INFO clients
+       # Shows connected clients — you should see at least 1 (your app)
+
+       EXIT
+
+2. Test from your app's perspective:
+       docker compose exec app sh
+       # Wait — your production image doesn't have redis-cli!
+       # That's correct — production images should be minimal.
+       exit
+
+   This is WHY we mapped Redis port 6379 to the host.
+   You can connect from your machine instead.
+
+3. If you have redis-cli installed locally (or install it via WSL2):
+       redis-cli -h localhost -p 6379
+       PING
+       # Should return PONG
+
+
+================================================================================
+CHECKLIST BEFORE MOVING TO DAY 3-4
+================================================================================
+
+[ ] Redis added to docker-compose.yml with healthcheck and memory limit
+[ ] REDIS_URL added to environment config (env.ts + .env + docker-compose)
+[ ] ioredis installed (npm install ioredis)
+[ ] redis.plugin.ts created with connection handling and graceful shutdown
+[ ] Plugin registered in app.ts
+[ ] Healthcheck shows redis: "connected"
+[ ] Explored Redis data structures with redis-cli (SET, GET, HSET, LPUSH, ZADD)
+[ ] Understand: why Redis is fast, how it differs from Postgres, what TTL/LRU means
+
+When all checkboxes are done, move to Day 3-4.
+
+
+================================================================================
+================================================================================
+DAY 3-4: ADD CACHING TO TINYSCALE
+================================================================================
+================================================================================
+
+Now we put Redis to work. There are three things to cache:
+
+    1. Redirect lookups (short_code → original_url) — THE BIG WIN
+    2. Rate limiting (move from in-memory to Redis)
+    3. Stats queries (expensive aggregations)
+
+
+================================================================================
+STEP 1: UNDERSTAND THE CACHE-ASIDE PATTERN
+================================================================================
+
+This is the most common caching pattern. Here's how it works:
+
+    WITHOUT CACHE (current):
+    ┌─────────┐     ┌──────┐     ┌──────────┐
+    │  Client  │────→│  App │────→│ Postgres │
+    │          │←────│      │←────│          │
+    └─────────┘     └──────┘     └──────────┘
+    Every request hits the database. Every. Single. One.
+
+    WITH CACHE-ASIDE:
+    ┌─────────┐     ┌──────┐     ┌───────┐
+    │  Client  │────→│  App │────→│ Redis │ ← Check cache FIRST
+    │          │←────│      │←────│       │
+    └─────────┘     └──────┘     └───────┘
+                        │              ↑
+                        │ CACHE MISS   │ Store result
+                        ↓              │
+                    ┌──────────┐       │
+                    │ Postgres │───────┘
+                    │          │
+                    └──────────┘
+
+    The flow:
+    1. App receives request for short_code "Ax7bK2"
+    2. App checks Redis: GET "url:Ax7bK2"
+    3. CACHE HIT → Redis returns the URL → respond immediately (fast!)
+    4. CACHE MISS → Redis returns nil → query Postgres → store result in Redis → respond
+    5. Next request for "Ax7bK2" hits the cache (step 3)
+
+    This is called "cache-aside" (or "lazy loading") because:
+    - The cache is populated ON DEMAND (not pre-loaded)
+    - The app manages the cache (not the database)
+    - The cache sits ASIDE the main data path
+
+>> OTHER CACHING PATTERNS (know they exist): <<
+
+    Write-Through: App writes to cache AND database on every write.
+        Pro: Cache is always up-to-date. Con: Writes are slower.
+
+    Write-Behind: App writes to cache, cache async writes to database.
+        Pro: Writes are fast. Con: Data loss risk if cache crashes before writing to DB.
+
+    Read-Through: Cache itself fetches from database on miss (cache is smart).
+        Pro: Simpler app code. Con: Cache needs DB access.
+
+    We use Cache-Aside because it's the simplest, most predictable,
+    and gives us full control. This is what 90% of applications use.
+
+
+================================================================================
+STEP 2: CREATE A CACHE SERVICE
+================================================================================
+
+Create a new file: src/services/cache.service.ts
+
+--- START OF src/services/cache.service.ts ---
+
+import { type FastifyInstance } from "fastify";
+
+// Default TTL: 1 hour (in seconds)
+const DEFAULT_TTL = 3600;
+
+// Prefix all cache keys to avoid collisions with other Redis uses
+// (BullMQ, sessions, rate limits will also use Redis)
+const KEY_PREFIX = "cache:";
+
+/**
+ * Cache-aside: Get from cache, or fetch from source and cache the result.
+ *
+ * @param app - Fastify instance (for app.redis)
+ * @param key - Cache key (will be prefixed with "cache:")
+ * @param fetchFn - Function to call on cache miss (fetches from DB)
+ * @param ttl - Time to live in seconds (default: 3600 = 1 hour)
+ * @returns The cached or freshly fetched value
+ */
+export async function cacheGet<T>(
+  app: FastifyInstance,
+  key: string,
+  fetchFn: () => Promise<T>,
+  ttl: number = DEFAULT_TTL
+): Promise<T> {
+  const cacheKey = `${KEY_PREFIX}${key}`;
+
+  try {
+    // Step 1: Try to get from cache
+    const cached = await app.redis.get(cacheKey);
+
+    if (cached !== null) {
+      // CACHE HIT — parse and return
+      app.log.debug({ key: cacheKey }, "Cache HIT");
+      return JSON.parse(cached) as T;
+    }
+  } catch (err) {
+    // If Redis fails, log and continue to database
+    // This is graceful degradation — app works without cache
+    app.log.warn(err, "Redis GET failed, falling through to database");
+  }
+
+  // Step 2: CACHE MISS — fetch from the source (database)
+  app.log.debug({ key: cacheKey }, "Cache MISS");
+  const value = await fetchFn();
+
+  // Step 3: Store in cache for next time
+  try {
+    await app.redis.set(cacheKey, JSON.stringify(value), "EX", ttl);
+    // "EX" = expire in seconds
+    // After `ttl` seconds, Redis automatically deletes this key
+  } catch (err) {
+    // Cache write failure is non-fatal — next request will try again
+    app.log.warn(err, "Redis SET failed");
+  }
+
+  return value;
+}
+
+/**
+ * Invalidate (delete) a cached key.
+ * Call this when the underlying data changes (e.g., URL is updated or deleted).
+ */
+export async function cacheInvalidate(
+  app: FastifyInstance,
+  key: string
+): Promise<void> {
+  const cacheKey = `${KEY_PREFIX}${key}`;
+
+  try {
+    await app.redis.del(cacheKey);
+    app.log.debug({ key: cacheKey }, "Cache invalidated");
+  } catch (err) {
+    app.log.warn(err, "Redis DEL failed");
+  }
+}
+
+/**
+ * Invalidate all keys matching a pattern.
+ * Use sparingly — SCAN-based deletion is slower than direct DEL.
+ *
+ * Example: cacheInvalidatePattern(app, "stats:*") — clears all stats caches
+ */
+export async function cacheInvalidatePattern(
+  app: FastifyInstance,
+  pattern: string
+): Promise<void> {
+  const fullPattern = `${KEY_PREFIX}${pattern}`;
+
+  try {
+    // SCAN is safe for production (unlike KEYS which blocks Redis)
+    let cursor = "0";
+    do {
+      const [nextCursor, keys] = await app.redis.scan(
+        cursor,
+        "MATCH",
+        fullPattern,
+        "COUNT",
+        100
+      );
+      cursor = nextCursor;
+
+      if (keys.length > 0) {
+        await app.redis.del(...keys);
+        app.log.debug({ pattern: fullPattern, deleted: keys.length }, "Cache pattern invalidated");
+      }
+    } while (cursor !== "0");
+  } catch (err) {
+    app.log.warn(err, "Redis pattern invalidation failed");
+  }
+}
+
+--- END OF src/services/cache.service.ts ---
+
+
+>> WHAT JUST HAPPENED? <<
+
+1. `cacheGet<T>()` — The main function. Implements cache-aside pattern.
+   Generic type `<T>` means it works with any data type.
+
+2. `cacheInvalidate()` — Deletes a specific cache key.
+   You call this when data changes (URL updated, deleted, etc.).
+
+3. `cacheInvalidatePattern()` — Deletes all keys matching a pattern.
+   Uses SCAN (not KEYS) because KEYS blocks Redis with large datasets.
+
+4. EVERY Redis call is wrapped in try/catch. If Redis fails, the app
+   continues normally (just slower, hitting Postgres directly).
+   This is CRITICAL — your cache should never break your app.
+
+5. All keys are prefixed with "cache:" to avoid collisions with
+   BullMQ keys, session keys, rate limit keys, etc.
+
+
+================================================================================
+STEP 3: ADD CACHING TO THE REDIRECT (THE HOT PATH)
+================================================================================
+
+This is the biggest performance win. Every redirect currently queries Postgres.
+Let's cache it.
+
+Open src/modules/url/url.service.ts and modify `resolveShortCode`:
+
+--- MODIFY src/modules/url/url.service.ts ---
+
+Add the import at the top:
+
+    import { cacheGet, cacheInvalidate } from "../../services/cache.service.js";
+
+Now replace the `resolveShortCode` function with this:
+
+export async function resolveShortCode(app: FastifyInstance, code: string) {
+  // Use cache-aside pattern: check Redis first, then Postgres
+  const url = await cacheGet(
+    app,
+    `url:${code}`,    // Cache key: "cache:url:Ax7bK2"
+    async () => {
+      // This only runs on CACHE MISS
+      const [result] = await app.db
+        .select()
+        .from(urls)
+        .where(eq(urls.shortCode, code))
+        .limit(1);
+
+      return result ?? null;
+    },
+    3600   // TTL: 1 hour. After this, next request re-fetches from Postgres.
+  );
+
+  if (!url) {
+    throw new NotFoundError("Short URL not found");
+  }
+
+  // Check expiration
+  if (url.expiresAt && new Date(url.expiresAt) < new Date()) {
+    // URL expired — invalidate the cache so we don't keep serving it
+    await cacheInvalidate(app, `url:${code}`);
+    throw new NotFoundError("Short URL has expired");
+  }
+
+  return url;
+}
+
+--- END OF MODIFICATION ---
+
+
+>> WHAT CHANGED? <<
+
+BEFORE:
+    resolveShortCode → Postgres query → return
+
+AFTER:
+    resolveShortCode → Redis GET → HIT? return immediately
+                                  → MISS? Postgres query → Redis SET → return
+
+The first request for "Ax7bK2" hits Postgres (miss). Every subsequent request
+for the next hour hits Redis (hit). For a popular short URL that gets clicked
+1000 times/day, that's 999 Redis hits and 1 Postgres query instead of 1000.
+
+
+>> WHAT ABOUT CACHE INVALIDATION? <<
+
+"There are only two hard things in Computer Science: cache invalidation
+and naming things." — Phil Karlton
+
+When do we need to invalidate (delete) the cache?
+
+1. URL expires → we handle this above (invalidate on expiry check)
+2. URL is deleted → we'd add cacheInvalidate when implementing delete
+3. URL is updated → we'd add cacheInvalidate when implementing update
+
+For now, our URLs are immutable (can't be updated or deleted via API),
+so TTL-based expiration is sufficient. The cache auto-expires after 1 hour,
+and the next request re-fetches from Postgres.
+
+If you later add a DELETE /api/urls/:code endpoint, you MUST also call:
+    await cacheInvalidate(app, `url:${code}`);
+Otherwise users will still be redirected to a deleted URL for up to 1 hour.
+
+
+================================================================================
+STEP 4: ADD CACHING TO STATS (EXPENSIVE QUERIES)
+================================================================================
+
+Your stats endpoint runs 4 database queries (total clicks, clicks by date,
+top referrers, top countries). These are expensive aggregations.
+
+Open src/modules/stats/stats.service.ts and modify it:
+
+--- MODIFY src/modules/stats/stats.service.ts ---
+
+Add the import at the top:
+
+    import { cacheGet } from "../../services/cache.service.js";
+
+Now wrap the stats query in cacheGet:
+
+export async function getUrlStats(app: FastifyInstance, code: string) {
+  return cacheGet(
+    app,
+    `stats:${code}`,   // Cache key: "cache:stats:Ax7bK2"
+    async () => {
+      // ---- Everything below is your existing code ----
+
+      // Get the URL
+      const [url] = await app.db
+        .select()
+        .from(urls)
+        .where(eq(urls.shortCode, code))
+        .limit(1);
+
+      if (!url) {
+        throw new NotFoundError("Short URL not found");
+      }
+
+      // Total clicks
+      const [totalResult] = await app.db
+        .select({ count: count() })
+        .from(clicks)
+        .where(eq(clicks.urlId, url.id));
+
+      const totalClicks = totalResult?.count ?? 0;
+
+      // Clicks by date
+      const clicksByDate = await app.db
+        .select({
+          date: sql<string>`DATE(${clicks.clickedAt})::text`,
+          count: count(),
+        })
+        .from(clicks)
+        .where(eq(clicks.urlId, url.id))
+        .groupBy(sql`DATE(${clicks.clickedAt})`)
+        .orderBy(sql`DATE(${clicks.clickedAt})`);
+
+      // Top referrers
+      const referrers = await app.db
+        .select({
+          referrer: sql<string>`COALESCE(${clicks.referrer}, 'Direct')`,
+          count: count(),
+        })
+        .from(clicks)
+        .where(eq(clicks.urlId, url.id))
+        .groupBy(clicks.referrer)
+        .orderBy(sql`count(*) DESC`)
+        .limit(10);
+
+      // Top countries
+      const countries = await app.db
+        .select({
+          country: sql<string>`COALESCE(${clicks.country}, 'Unknown')`,
+          count: count(),
+        })
+        .from(clicks)
+        .where(eq(clicks.urlId, url.id))
+        .groupBy(clicks.country)
+        .orderBy(sql`count(*) DESC`)
+        .limit(10);
+
+      return {
+        shortCode: url.shortCode,
+        originalUrl: url.originalUrl,
+        totalClicks,
+        clicksByDate,
+        referrers,
+        countries,
+      };
+    },
+    60   // TTL: 60 seconds — stats update relatively quickly
+         // We don't want stale stats for too long, but we also don't
+         // want to hammer Postgres with aggregations on every request.
+         // 60 seconds is a good balance.
+  );
+}
+
+--- END OF MODIFICATION ---
+
+
+>> WHY ONLY 60 SECONDS TTL FOR STATS? <<
+
+Stats change frequently (every click updates them).
+A 1-hour cache would show outdated click counts.
+60 seconds means stats are at most 1 minute behind, which is acceptable.
+
+The redirect cache uses 3600s (1 hour) because URLs rarely change.
+Different data = different TTL. This is a common pattern.
+
+NOTE: This caches the entire stats response including the NotFoundError path.
+If a URL doesn't exist, the cacheGet fetchFn throws NotFoundError, which
+propagates up without being cached (because cacheGet only caches successful results).
+This is correct behavior — you don't want to cache "not found" responses.
+
+Wait — actually, let's look at this more carefully. The `throw` inside `fetchFn`
+will propagate out of `cacheGet` without caching, which IS the right behavior.
+Errors aren't cached. Only successful results are cached. Good.
+
+
+================================================================================
+STEP 5: MOVE RATE LIMITING TO REDIS
+================================================================================
+
+Currently, @fastify/rate-limit uses an in-memory store. This works fine
+for a single server instance. But when you run 3 app replicas (Week 7),
+each instance has its own counter. A user could make 100 requests to
+instance 1, 100 to instance 2, and 100 to instance 3 — 300 total,
+bypassing your 100/minute limit.
+
+With Redis-backed rate limiting, all instances share the same counter.
+
+Open src/plugins/rate-limit.plugin.ts and modify it:
+
+--- MODIFY src/plugins/rate-limit.plugin.ts ---
+
+Replace the entire file contents with:
+
+import fp from "fastify-plugin";
+import rateLimit from "@fastify/rate-limit";
+import { type FastifyInstance } from "fastify";
+import { env } from "../config/env.js";
+
+export const rateLimitPlugin = fp(async (fastify: FastifyInstance) => {
+  await fastify.register(rateLimit, {
+    max: env.NODE_ENV === "test" ? 1000 : 100,
+    timeWindow: "1 minute",
+    keyGenerator: (request) => {
+      const apiKey = request.headers["x-api-key"];
+      if (typeof apiKey === "string") return apiKey;
+      return request.ip;
+    },
+    // Use Redis as the backing store for rate limit counters
+    redis: fastify.redis,
+    // This tells @fastify/rate-limit to use Redis instead of in-memory.
+    // All app instances now share the same rate limit counters.
+    // The rate limit data is stored in Redis keys like:
+    //   "fastify-rate-limit-<ip>-<timeWindow>"
+    //
+    // WHY THIS MATTERS:
+    // - With in-memory: 3 app instances = 3x the limit (bad)
+    // - With Redis: 3 app instances = 1 shared limit (correct)
+  });
+});
+
+--- END OF MODIFICATION ---
+
+
+>> IMPORTANT: REGISTRATION ORDER <<
+
+The rate limit plugin now uses `fastify.redis`. This means the Redis plugin
+MUST be registered BEFORE the rate limit plugin. Check your app.ts:
+
+    await app.register(dbPlugin);
+    await app.register(redisPlugin);      // ← Redis FIRST
+    await app.register(authPlugin);
+    await app.register(rateLimitPlugin);  // ← Rate limit AFTER (uses app.redis)
+
+If they're in the wrong order, you'll get:
+    "Cannot read properties of undefined (reading 'redis')"
+
+
+================================================================================
+STEP 6: ADD REAL-TIME CLICK COUNTER WITH SORTED SETS
+================================================================================
+
+This is a bonus optimization. Instead of querying Postgres for "total clicks
+per URL" (which requires COUNT(*) on the clicks table), maintain a real-time
+counter in Redis.
+
+Open src/modules/url/url.service.ts and modify the `recordClick` function:
+
+--- MODIFY the recordClick function in src/modules/url/url.service.ts ---
+
+Replace the existing recordClick with:
+
+export async function recordClick(
+  app: FastifyInstance,
+  urlId: string,
+  shortCode: string,
+  meta: { referrer?: string; userAgent?: string; ip?: string }
+) {
+  // Write click to Postgres (source of truth)
+  await app.db.insert(clicks).values({
+    urlId,
+    referrer: meta.referrer ?? null,
+    userAgent: meta.userAgent ?? null,
+    ip: meta.ip ?? null,
+  });
+
+  // Increment click counter in Redis sorted set (real-time leaderboard)
+  try {
+    await app.redis.zincrby("clicks:leaderboard", 1, shortCode);
+    // ZINCRBY "clicks:leaderboard" 1 "Ax7bK2"
+    // Increments the score of "Ax7bK2" by 1
+    // This gives us a real-time "most clicked URLs" leaderboard
+
+    // Also invalidate the stats cache for this URL
+    // (stats are now stale because we just recorded a new click)
+    await app.redis.del(`cache:stats:${shortCode}`);
+  } catch (err) {
+    // Redis failure is non-fatal — Postgres has the data
+    app.log.warn(err, "Redis click counter update failed");
+  }
+}
+
+--- END OF MODIFICATION ---
+
+
+Now update the redirectHandler to pass the shortCode:
+
+Open src/modules/url/url.handler.ts and modify the recordClick call:
+
+--- MODIFY the fire-and-forget call in url.handler.ts ---
+
+Change this:
+    recordClick(request.server, url.id, {
+      referrer: request.headers.referer ?? request.headers.referrer as string | undefined,
+      userAgent: request.headers["user-agent"],
+      ip: request.ip,
+    }).catch((err) => request.log.error(err, "Failed to record click"));
+
+To this:
+    recordClick(request.server, url.id, url.shortCode, {
+      referrer: request.headers.referer ?? request.headers.referrer as string | undefined,
+      userAgent: request.headers["user-agent"],
+      ip: request.ip,
+    }).catch((err) => request.log.error(err, "Failed to record click"));
+
+--- END OF MODIFICATION ---
+
+Note: We added `url.shortCode` as the third argument. This is needed so
+recordClick can update the Redis sorted set and invalidate the stats cache.
+
+
+================================================================================
+STEP 7: BUILD IT AND TEST
+================================================================================
+
+Rebuild and start everything:
+
+    docker compose down
+    docker compose up --build
+
+Wait for all services to start, then test the full flow:
+
+1. CHECK HEALTHCHECK SHOWS REDIS:
+
+    curl http://localhost/healthcheck
+
+    Expected: {"status":"ok","redis":"connected"}
+
+2. REGISTER AND LOGIN:
+
+    curl -X POST http://localhost/api/auth/register \
+      -H "Content-Type: application/json" \
+      -d '{"email":"redis-test@test.com","password":"test1234"}'
+
+    curl -X POST http://localhost/api/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"email":"redis-test@test.com","password":"test1234"}'
+
+    Save the token from the login response.
+
+3. CREATE A SHORT URL:
+
+    curl -X POST http://localhost/api/shorten \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer YOUR_TOKEN" \
+      -d '{"url":"https://www.google.com"}'
+
+    Note the shortCode (e.g., "Ax7bK2").
+
+4. FIRST REDIRECT (CACHE MISS):
+
+    curl -v http://localhost/YOUR_SHORT_CODE 2>&1 | head -20
+
+    This hits Postgres (cache miss) and stores the result in Redis.
+
+5. CHECK REDIS — THE URL IS NOW CACHED:
+
+    docker compose exec redis redis-cli
+
+    KEYS *
+    # You should see: "cache:url:YOUR_SHORT_CODE"
+
+    GET "cache:url:YOUR_SHORT_CODE"
+    # Returns the JSON-serialized URL object
+
+    TTL "cache:url:YOUR_SHORT_CODE"
+    # Returns ~3600 (seconds remaining)
+
+    EXIT
+
+6. SECOND REDIRECT (CACHE HIT):
+
+    curl -v http://localhost/YOUR_SHORT_CODE 2>&1 | head -20
+
+    This time it hits Redis (cache hit) — should be noticeably faster.
+    Check the app logs to see "Cache HIT" vs "Cache MISS":
+
+    docker compose logs app --tail 20
+
+7. TEST THE CLICK LEADERBOARD:
+
+    # Click the same URL a few times
+    curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
+    curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
+    curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
+
+    docker compose exec redis redis-cli
+
+    ZREVRANGE clicks:leaderboard 0 9 WITHSCORES
+    # Shows your URL with its click count
+
+    EXIT
+
+8. TEST STATS CACHING:
+
+    curl http://localhost/api/stats/YOUR_SHORT_CODE \
+      -H "Authorization: Bearer YOUR_TOKEN"
+
+    # First call: cache miss (hits Postgres, 4 queries)
+    # Second call within 60 seconds: cache hit (from Redis, 0 queries)
+
+    curl http://localhost/api/stats/YOUR_SHORT_CODE \
+      -H "Authorization: Bearer YOUR_TOKEN"
+
+    Check Redis:
+
+    docker compose exec redis redis-cli
+    KEYS "cache:stats:*"
+    # Should see your stats cache key
+    TTL "cache:stats:YOUR_SHORT_CODE"
+    # Should show ~60 seconds remaining
+    EXIT
+
+9. TEST RATE LIMITING IN REDIS:
+
+    docker compose exec redis redis-cli
+    KEYS "*rate*"
+    # Should show rate limit keys created by @fastify/rate-limit
+    EXIT
+
+
+================================================================================
+CHECKLIST BEFORE MOVING TO DAY 5-6
+================================================================================
+
+[ ] Cache service created (cache.service.ts) with cacheGet, cacheInvalidate
+[ ] Redirect caching working (cache-aside pattern, 1 hour TTL)
+[ ] Stats caching working (60 second TTL)
+[ ] Rate limiting moved to Redis
+[ ] Click counter sorted set working (ZINCRBY)
+[ ] Stats cache invalidated on new clicks
+[ ] Healthcheck shows Redis connected
+[ ] Verified cache hit/miss in logs
+[ ] Verified cached keys in redis-cli
+[ ] Understand: cache-aside pattern, TTL, cache invalidation, graceful degradation
+
+
+================================================================================
+================================================================================
+DAY 5-6: BACKGROUND JOB PROCESSING WITH BULLMQ
+================================================================================
+================================================================================
+
+BEFORE YOU TOUCH ANY COMMANDS - READ AND UNDERSTAND THIS:
+----------------------------------------------------------
+
+>> THE PROBLEM WE'RE SOLVING <<
+
+Look at your current redirect handler (src/modules/url/url.handler.ts):
+
+    export async function redirectHandler(...) {
+      const url = await resolveShortCode(request.server, request.params.code);
+
+      // Fire-and-forget click recording
+      recordClick(request.server, url.id, url.shortCode, {
+        referrer: ...,
+        userAgent: ...,
+        ip: ...,
+      }).catch((err) => request.log.error(err, "Failed to record click"));
+
+      return reply.redirect(url.originalUrl);
+    }
+
+The redirect is fast because we "fire-and-forget" the click recording.
+But there are problems:
+
+1. FIRE-AND-FORGET IS UNRELIABLE:
+   If the Postgres INSERT fails, we just log it and lose the click data.
+   No retry. No recovery. The analytics are permanently wrong.
+
+2. NO BACKPRESSURE:
+   If 10,000 users click simultaneously, we fire 10,000 concurrent Postgres
+   INSERTs. The database connection pool (max: 20) becomes a bottleneck.
+   Queries queue up, latency spikes, and some may timeout.
+
+3. NO BATCHING:
+   Each click = 1 INSERT query. 10,000 clicks = 10,000 queries.
+   A single INSERT with 10,000 rows would be 100x more efficient.
+
+4. MIXED WORKLOADS:
+   The same app process handles redirects (user-facing, latency-critical)
+   AND click recording (background, throughput-critical).
+   A slow click recording can starve the event loop from handling redirects.
+
+>> THE SOLUTION: JOB QUEUES <<
+
+Instead of processing clicks inline, we QUEUE them for later processing:
+
+    BEFORE:
+    Request → Resolve URL → INSERT click → Redirect
+                             ↑ slow, unreliable
+
+    AFTER:
+    Request → Resolve URL → PUSH to queue → Redirect (immediate!)
+                             ↑ instant (~1ms)
+
+    Meanwhile, in a separate process:
+    Worker → POP from queue → Batch INSERT clicks → Confirm processed
+
+Benefits:
+1. FAST REDIRECT: Pushing to a queue is ~1ms. Redirect happens immediately.
+2. RELIABLE: If the worker crashes, the job stays in the queue. It's retried.
+3. BATCHING: Worker can collect 100 clicks and INSERT them in one query.
+4. BACKPRESSURE: Worker processes at its own pace. Queue absorbs bursts.
+5. SEPARATION: Redirect handler is isolated from click processing problems.
+
+>> WHAT IS BULLMQ? <<
+
+BullMQ is a Redis-based job queue for Node.js. It uses Redis lists and streams
+to implement a reliable, distributed job queue with:
+
+    - Job persistence (jobs survive app restarts — they're in Redis)
+    - Automatic retries (failed jobs are retried with exponential backoff)
+    - Dead letter queue (jobs that fail N times are moved aside, not lost)
+    - Job prioritization (some jobs can be processed before others)
+    - Concurrency control (process N jobs simultaneously)
+    - Job scheduling (process jobs at a specific time)
+    - Job progress (report progress during long-running jobs)
+
+BullMQ stores everything in Redis. It uses Redis's atomic operations (BRPOPLPUSH,
+Lua scripts) to ensure jobs are never lost and never processed twice.
+
+>> WHY BULLMQ AND NOT JUST Redis LPUSH/RPOP? <<
+
+You COULD build a simple queue with Redis lists:
+
+    // Producer
+    await redis.lpush("queue:clicks", JSON.stringify(clickData));
+
+    // Consumer
+    const data = await redis.brpop("queue:clicks", 0);
+    await processClick(data);
+
+Problems with this DIY approach:
+1. No retry logic (if processing fails, the job is gone)
+2. No dead letter queue (no way to inspect failed jobs)
+3. No concurrency control (process one job at a time? multiple? how many?)
+4. No monitoring (how many jobs pending? how many failed?)
+5. No job deduplication
+6. Race conditions with multiple consumers
+
+BullMQ solves all of these. It's production-tested at scale.
+Companies like Adobe, Microsoft, and Salesforce use it.
+
+
+================================================================================
+STEP 1: INSTALL BULLMQ
+================================================================================
+
+    npm install bullmq
+
+That's it. BullMQ has zero dependencies outside of ioredis (which we already have).
+
+NOTE: BullMQ requires ioredis with `maxRetriesPerRequest: null`.
+This is different from our app's ioredis config (which has maxRetriesPerRequest: 3).
+BullMQ will create its own internal Redis connections with the right settings.
+We'll pass the REDIS_URL to BullMQ, not the ioredis instance.
+
+
+================================================================================
+STEP 2: CREATE THE CLICK QUEUE PRODUCER
+================================================================================
+
+Create the queue definition and producer.
+
+Create a new folder and file: src/jobs/click-queue.ts
+
+--- START OF src/jobs/click-queue.ts ---
+
+import { Queue } from "bullmq";
+import { env } from "../config/env.js";
+
+// Define the shape of a click job's data
+export interface ClickJobData {
+  urlId: string;
+  shortCode: string;
+  referrer: string | null;
+  userAgent: string | null;
+  ip: string | null;
+  clickedAt: string;  // ISO timestamp — serialize dates as strings for JSON
+}
+
+// Queue name — must be the same in producer and consumer
+export const CLICK_QUEUE_NAME = "clicks";
+
+// Create the queue (producer side)
+// This is the "mailbox" where you drop off jobs.
+export function createClickQueue(): Queue<ClickJobData> {
+  return new Queue<ClickJobData>(CLICK_QUEUE_NAME, {
+    connection: {
+      host: new URL(env.REDIS_URL).hostname,
+      port: parseInt(new URL(env.REDIS_URL).port || "6379"),
+      // BullMQ needs host/port, not a URL string
+      maxRetriesPerRequest: null,
+      // IMPORTANT: BullMQ REQUIRES this to be null.
+      // Without it, you'll get: "maxRetriesPerRequest must be null"
+    },
+    defaultJobOptions: {
+      attempts: 3,
+      // If a job fails, retry up to 3 times
+
+      backoff: {
+        type: "exponential",
+        delay: 1000,
+        // Retry delays: 1s, 2s, 4s (exponential backoff)
+        // This prevents hammering a failing service
+      },
+
+      removeOnComplete: {
+        count: 1000,
+        // Keep the last 1000 completed jobs for debugging/monitoring
+        // Older completed jobs are automatically deleted from Redis
+        // Without this, completed jobs accumulate and waste Redis memory
+      },
+
+      removeOnFail: {
+        count: 5000,
+        // Keep the last 5000 failed jobs for investigation
+        // You need to see WHY jobs failed
+      },
+    },
+  });
+}
+
+--- END OF src/jobs/click-queue.ts ---
+
+
+>> WHAT JUST HAPPENED? <<
+
+We defined:
+1. `ClickJobData` — the TypeScript interface for click event data
+2. `CLICK_QUEUE_NAME` — "clicks" — the queue name (shared between producer and consumer)
+3. `createClickQueue()` — creates a BullMQ Queue instance (the producer)
+
+The Queue object is the PRODUCER side. It can:
+- Add jobs: queue.add("click", { urlId: "...", ... })
+- Get job counts: queue.getJobCounts()
+- Clean old jobs: queue.clean(...)
+
+It does NOT process jobs. That's the Worker's job (next step).
+
+
+================================================================================
+STEP 3: CREATE THE CLICK QUEUE WORKER
+================================================================================
+
+Create a new file: src/jobs/click-worker.ts
+
+--- START OF src/jobs/click-worker.ts ---
+
+import { Worker, type Job } from "bullmq";
+import { env } from "../config/env.js";
+import { CLICK_QUEUE_NAME, type ClickJobData } from "./click-queue.js";
+import { drizzle } from "drizzle-orm/node-postgres";
+import pg from "pg";
+import { clicks } from "../db/schema/index.js";
+import Redis from "ioredis";
+
+// Batch settings
+const BATCH_SIZE = 50;
+const BATCH_TIMEOUT_MS = 5000; // 5 seconds
+
+// Buffer to collect clicks before flushing to DB
+let clickBuffer: ClickJobData[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+// We need our own DB connection (not the app's)
+// because the worker runs in a separate context
+let pool: pg.Pool | null = null;
+let db: ReturnType<typeof drizzle> | null = null;
+let redis: Redis | null = null;
+
+function getDb() {
+  if (!db) {
+    pool = new pg.Pool({
+      connectionString: env.DATABASE_URL,
+      max: 5, // Worker doesn't need many connections
+    });
+    db = drizzle(pool);
+  }
+  return db;
+}
+
+function getRedis() {
+  if (!redis) {
+    redis = new Redis(env.REDIS_URL);
+  }
+  return redis;
+}
+
+/**
+ * Flush the click buffer to Postgres in a single batch INSERT.
+ * This is dramatically more efficient than individual INSERTs.
+ */
+async function flushClickBuffer(): Promise<void> {
+  if (clickBuffer.length === 0) return;
+
+  // Grab current buffer and reset
+  const batch = clickBuffer;
+  clickBuffer = [];
+
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+
+  const database = getDb();
+
+  try {
+    // BATCH INSERT — one query for N clicks instead of N queries
+    await database.insert(clicks).values(
+      batch.map((click) => ({
+        urlId: click.urlId,
+        referrer: click.referrer,
+        userAgent: click.userAgent,
+        ip: click.ip,
+        clickedAt: new Date(click.clickedAt),
+      }))
+    );
+
+    console.log(`[ClickWorker] Flushed ${batch.length} clicks to database`);
+
+    // Update Redis click leaderboard for each unique shortCode in the batch
+    const r = getRedis();
+    const shortCodeCounts = new Map<string, number>();
+    for (const click of batch) {
+      shortCodeCounts.set(
+        click.shortCode,
+        (shortCodeCounts.get(click.shortCode) ?? 0) + 1
+      );
+    }
+    for (const [code, count] of shortCodeCounts) {
+      await r.zincrby("clicks:leaderboard", count, code);
+      // Invalidate stats cache since clicks changed
+      await r.del(`cache:stats:${code}`);
+    }
+  } catch (err) {
+    console.error(`[ClickWorker] Flush failed for ${batch.length} clicks:`, err);
+    // Put failed clicks back in the buffer for next flush
+    // This is a simple retry — BullMQ also retries the individual jobs
+    clickBuffer.unshift(...batch);
+    throw err; // Re-throw so BullMQ marks the job as failed
+  }
+}
+
+/**
+ * Schedule a flush after BATCH_TIMEOUT_MS if one isn't already scheduled.
+ * This ensures clicks are written even during low-traffic periods.
+ */
+function scheduleFlush(): void {
+  if (!flushTimer) {
+    flushTimer = setTimeout(() => {
+      flushClickBuffer().catch((err) => {
+        console.error("[ClickWorker] Scheduled flush failed:", err);
+      });
+    }, BATCH_TIMEOUT_MS);
+  }
+}
+
+/**
+ * Create and start the click worker.
+ * The worker pulls jobs from the "clicks" queue and processes them.
+ */
+export function createClickWorker(): Worker<ClickJobData> {
+  const worker = new Worker<ClickJobData>(
+    CLICK_QUEUE_NAME,
+    async (job: Job<ClickJobData>) => {
+      // Add click to buffer
+      clickBuffer.push(job.data);
+
+      // Flush if buffer is full
+      if (clickBuffer.length >= BATCH_SIZE) {
+        await flushClickBuffer();
+      } else {
+        // Schedule a flush in case traffic is slow
+        scheduleFlush();
+      }
+    },
+    {
+      connection: {
+        host: new URL(env.REDIS_URL).hostname,
+        port: parseInt(new URL(env.REDIS_URL).port || "6379"),
+        maxRetriesPerRequest: null,
+      },
+      concurrency: 10,
+      // Process up to 10 jobs concurrently.
+      // This fills the buffer faster for more efficient batch inserts.
+      // Each job just adds to the buffer (fast), so high concurrency is fine.
+
+      limiter: {
+        max: 1000,
+        duration: 1000,
+        // Process at most 1000 jobs per second.
+        // This prevents the worker from overwhelming Postgres.
+      },
+    }
+  );
+
+  // Event handlers — important for monitoring and debugging
+  worker.on("completed", (job) => {
+    // Individual job completed — don't log each one (too noisy)
+    // Batch flushes are logged in flushClickBuffer()
+  });
+
+  worker.on("failed", (job, err) => {
+    console.error(
+      `[ClickWorker] Job ${job?.id} failed (attempt ${job?.attemptsMade}/${job?.opts?.attempts}):`,
+      err.message
+    );
+  });
+
+  worker.on("error", (err) => {
+    console.error("[ClickWorker] Worker error:", err);
+  });
+
+  worker.on("stalled", (jobId) => {
+    console.warn(`[ClickWorker] Job ${jobId} stalled (took too long, will be retried)`);
+    // A "stalled" job means the worker took too long to process it.
+    // BullMQ assumes the worker crashed and re-queues the job.
+    // Default stall interval: 30 seconds.
+  });
+
+  console.log("[ClickWorker] Worker started, waiting for jobs...");
+
+  return worker;
+}
+
+/**
+ * Gracefully shut down the worker.
+ * Flushes any remaining clicks in the buffer before stopping.
+ */
+export async function shutdownClickWorker(worker: Worker): Promise<void> {
+  console.log("[ClickWorker] Shutting down...");
+
+  // Flush remaining clicks
+  await flushClickBuffer();
+
+  // Close the worker (stops pulling new jobs)
+  await worker.close();
+
+  // Close DB pool
+  if (pool) {
+    await pool.end();
+  }
+
+  // Close Redis
+  if (redis) {
+    await redis.quit();
+  }
+
+  console.log("[ClickWorker] Shutdown complete");
+}
+
+--- END OF src/jobs/click-worker.ts ---
+
+
+>> WHAT DOES THIS WORKER DO? <<
+
+1. PULLS jobs from the "clicks" queue in Redis
+2. BUFFERS them in memory (collects clicks)
+3. FLUSHES to Postgres in batches when:
+   - Buffer reaches 50 clicks (BATCH_SIZE), OR
+   - 5 seconds pass with no full batch (BATCH_TIMEOUT_MS)
+4. Updates the Redis click leaderboard for each batch
+5. Invalidates stats cache for affected URLs
+6. RETRIES failed flushes (BullMQ automatic retry with exponential backoff)
+7. Logs failed/stalled jobs for debugging
+
+The key insight: instead of 1000 individual INSERTs, we do 20 batch INSERTs
+of 50 rows each. This is dramatically faster because:
+- Fewer round-trips to Postgres
+- Fewer transaction commits
+- Better disk I/O patterns (sequential vs random)
+
+
+================================================================================
+STEP 4: CREATE THE BULLMQ PLUGIN
+================================================================================
+
+Create a new file: src/plugins/queue.plugin.ts
+
+--- START OF src/plugins/queue.plugin.ts ---
+
+import fp from "fastify-plugin";
+import { type FastifyInstance } from "fastify";
+import { type Queue } from "bullmq";
+import { createClickQueue, type ClickJobData } from "../jobs/click-queue.js";
+
+// Extend Fastify's type system
+declare module "fastify" {
+  interface FastifyInstance {
+    clickQueue: Queue<ClickJobData>;
+  }
+}
+
+export const queuePlugin = fp(async (fastify: FastifyInstance) => {
+  const clickQueue = createClickQueue();
+
+  fastify.decorate("clickQueue", clickQueue);
+
+  // Log queue events
+  clickQueue.on("error", (err) => {
+    fastify.log.error(err, "Click queue error");
+  });
+
+  // Clean up on shutdown
+  fastify.addHook("onClose", async () => {
+    fastify.log.info("Closing click queue");
+    await clickQueue.close();
+  });
+
+  fastify.log.info("Click queue initialized");
+});
+
+--- END OF src/plugins/queue.plugin.ts ---
+
+
+================================================================================
+STEP 5: START THE WORKER IN YOUR SERVER
+================================================================================
+
+The worker needs to run alongside your app. There are two approaches:
+
+APPROACH A: Run worker in the same process as the app (simpler, fine for now)
+APPROACH B: Run worker as a separate process/container (better for production)
+
+We'll use Approach A for now and discuss Approach B later.
+
+Open src/server.ts and modify it to start the worker:
+
+--- MODIFY src/server.ts ---
+
+Your server.ts should look like this (add the worker imports and startup):
+
+import { buildApp } from "./app.js";
+import { env } from "./config/env.js";
+import { createClickWorker, shutdownClickWorker } from "./jobs/click-worker.js";
+
+async function main() {
+  const app = await buildApp();
+
+  // Start the click worker (processes click jobs from the queue)
+  const clickWorker = createClickWorker();
+
+  // Graceful shutdown
+  const shutdown = async (signal: string) => {
+    app.log.info(`Received ${signal}, shutting down gracefully...`);
+
+    // Shut down worker first (flush remaining clicks)
+    await shutdownClickWorker(clickWorker);
+
+    // Then close the app (closes DB pool, Redis, etc.)
+    await app.close();
+
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
+  try {
+    await app.listen({ port: env.PORT, host: env.HOST });
+  } catch (err) {
+    app.log.error(err);
+    await shutdownClickWorker(clickWorker);
+    process.exit(1);
+  }
+}
+
+main();
+
+--- END OF MODIFICATION ---
+
+
+>> WHY GRACEFUL SHUTDOWN MATTERS: <<
+
+Without graceful shutdown:
+1. App gets SIGTERM (e.g., Docker stopping the container)
+2. Process dies immediately
+3. Clicks in the worker's buffer are LOST (never written to Postgres)
+4. In-progress Postgres queries might be interrupted
+
+With graceful shutdown:
+1. App gets SIGTERM
+2. Worker flushes remaining click buffer to Postgres
+3. Worker closes (stops pulling new jobs)
+4. App closes DB pool, Redis connection
+5. Process exits cleanly
+
+
+================================================================================
+STEP 6: REGISTER THE QUEUE PLUGIN AND UPDATE THE REDIRECT
+================================================================================
+
+First, register the queue plugin in app.ts:
+
+--- MODIFY src/app.ts ---
+
+Add the import:
+
+    import { queuePlugin } from "./plugins/queue.plugin.js";
+
+Register it after Redis:
+
+    await app.register(dbPlugin);
+    await app.register(redisPlugin);
+    await app.register(queuePlugin);     // ← ADD THIS LINE
+    await app.register(authPlugin);
+    await app.register(rateLimitPlugin);
+
+--- END OF MODIFICATION ---
+
+
+Now update the redirect handler to use the queue instead of direct DB insert.
+
+Open src/modules/url/url.handler.ts and modify the redirectHandler:
+
+--- MODIFY src/modules/url/url.handler.ts ---
+
+Replace the entire redirectHandler with:
+
+export async function redirectHandler(
+  request: FastifyRequest<{ Params: RedirectParams }>,
+  reply: FastifyReply
+) {
+  const url = await resolveShortCode(request.server, request.params.code);
+
+  // Instead of writing to Postgres directly, push a job to the queue.
+  // The worker will batch-insert clicks later.
+  request.server.clickQueue
+    .add("click", {
+      urlId: url.id,
+      shortCode: url.shortCode,
+      referrer: request.headers.referer ?? (request.headers.referrer as string | undefined) ?? null,
+      userAgent: request.headers["user-agent"] ?? null,
+      ip: request.ip ?? null,
+      clickedAt: new Date().toISOString(),
+    })
+    .catch((err) => request.log.error(err, "Failed to enqueue click"));
+
+  // Redirect immediately — don't wait for the queue
+  return reply.redirect(url.originalUrl);
+}
+
+--- END OF MODIFICATION ---
+
+
+>> WHAT CHANGED? <<
+
+BEFORE:
+    recordClick(app, urlId, shortCode, meta).catch(...)
+    ↓
+    Direct Postgres INSERT (~5-20ms)
+    + Redis ZINCRBY (~1ms)
+
+AFTER:
+    clickQueue.add("click", data).catch(...)
+    ↓
+    Redis LPUSH (~0.5ms) — just pushing to a list in Redis
+    Worker picks it up later → batch INSERT to Postgres
+
+The redirect is now ~10-20x faster on the click recording path.
+The user doesn't wait for Postgres at all.
+
+
+Now update the recordClick function in url.service.ts. Since clicks are now
+handled by the worker, the recordClick function is only used as a direct
+fallback. You can keep it for testing or remove the Redis leaderboard logic
+from it (since the worker now handles that).
+
+--- MODIFY src/modules/url/url.service.ts ---
+
+Simplify recordClick back to just the Postgres insert (the worker handles Redis):
+
+export async function recordClick(
+  app: FastifyInstance,
+  urlId: string,
+  shortCode: string,
+  meta: { referrer?: string; userAgent?: string; ip?: string }
+) {
+  // Direct insert — used only for testing or as a fallback
+  await app.db.insert(clicks).values({
+    urlId,
+    referrer: meta.referrer ?? null,
+    userAgent: meta.userAgent ?? null,
+    ip: meta.ip ?? null,
+  });
+}
+
+--- END OF MODIFICATION ---
+
+
+================================================================================
+STEP 7: ADD A DEAD LETTER QUEUE HANDLER
+================================================================================
+
+What happens when a click job fails 3 times (the max attempts)?
+It becomes a "failed" job. But we should know about it.
+
+Create a new file: src/jobs/dead-letter.ts
+
+--- START OF src/jobs/dead-letter.ts ---
+
+import { type Queue, QueueEvents } from "bullmq";
+import { env } from "../config/env.js";
+import { CLICK_QUEUE_NAME } from "./click-queue.js";
+
+/**
+ * Monitors the click queue for failed jobs that have exhausted all retries.
+ * In production, this would alert your monitoring system (PagerDuty, Slack, etc.)
+ */
+export function monitorDeadLetters(): QueueEvents {
+  const queueEvents = new QueueEvents(CLICK_QUEUE_NAME, {
+    connection: {
+      host: new URL(env.REDIS_URL).hostname,
+      port: parseInt(new URL(env.REDIS_URL).port || "6379"),
+      maxRetriesPerRequest: null,
+    },
+  });
+
+  queueEvents.on("failed", ({ jobId, failedReason }) => {
+    console.error(
+      `[DeadLetter] Job ${jobId} permanently failed: ${failedReason}`
+    );
+    // In production, you'd send this to your alerting system:
+    //   - Send Slack message
+    //   - Increment a Prometheus counter
+    //   - Log to a dead letter topic in Kafka (Week 5)
+  });
+
+  queueEvents.on("stalled", ({ jobId }) => {
+    console.warn(`[DeadLetter] Job ${jobId} stalled`);
+  });
+
+  console.log("[DeadLetter] Monitoring for failed jobs...");
+
+  return queueEvents;
+}
+
+--- END OF src/jobs/dead-letter.ts ---
+
+
+Add the dead letter monitor to server.ts:
+
+--- MODIFY src/server.ts ---
+
+Add the import:
+
+    import { monitorDeadLetters } from "./jobs/dead-letter.js";
+
+In the main() function, after creating the worker:
+
+    const clickWorker = createClickWorker();
+    const deadLetterMonitor = monitorDeadLetters();   // ← ADD THIS LINE
+
+In the shutdown function, close it:
+
+    const shutdown = async (signal: string) => {
+      app.log.info(`Received ${signal}, shutting down gracefully...`);
+      await shutdownClickWorker(clickWorker);
+      await deadLetterMonitor.close();   // ← ADD THIS LINE
+      await app.close();
+      process.exit(0);
+    };
+
+--- END OF MODIFICATION ---
+
+
+================================================================================
+STEP 8: ADD A QUEUE DASHBOARD ENDPOINT
+================================================================================
+
+Add an endpoint to monitor the queue. This is essential for debugging.
+
+Open src/app.ts and add a queue monitoring route:
+
+--- ADD this BEFORE the routes section in src/app.ts ---
+
+    // Queue monitoring (admin only in production — fine for dev)
+    app.get("/api/queue/stats", async (request) => {
+      const counts = await request.server.clickQueue.getJobCounts(
+        "active",
+        "completed",
+        "failed",
+        "delayed",
+        "waiting"
+      );
+
+      return {
+        queue: "clicks",
+        counts,
+      };
+    });
+
+--- END OF ADDITION ---
+
+
+================================================================================
+STEP 9: UPDATE THE HEALTHCHECK
+================================================================================
+
+Update the healthcheck to include queue status.
+
+--- MODIFY the healthcheck in src/app.ts ---
+
+Update to:
+
+    app.get("/healthcheck", async (request) => {
+      let redisStatus = "disconnected";
+      try {
+        const pong = await request.server.redis.ping();
+        redisStatus = pong === "PONG" ? "connected" : "error";
+      } catch {
+        redisStatus = "error";
+      }
+
+      let queueStatus = "unknown";
+      try {
+        const counts = await request.server.clickQueue.getJobCounts("waiting", "active", "failed");
+        queueStatus = `waiting:${counts.waiting} active:${counts.active} failed:${counts.failed}`;
+      } catch {
+        queueStatus = "error";
+      }
+
+      return {
+        status: "ok",
+        redis: redisStatus,
+        queue: queueStatus,
+      };
+    });
+
+--- END OF MODIFICATION ---
+
+
+================================================================================
+STEP 10: BUILD AND TEST THE FULL PIPELINE
+================================================================================
+
+    docker compose down
+    docker compose up --build
+
+Watch the logs. You should see:
+
+    [ClickWorker] Worker started, waiting for jobs...
+    [DeadLetter] Monitoring for failed jobs...
+    Redis connected
+    Click queue initialized
+
+Test the full flow:
+
+1. CHECK HEALTHCHECK:
+
+    curl http://localhost/healthcheck
+
+    Expected:
+    {
+      "status": "ok",
+      "redis": "connected",
+      "queue": "waiting:0 active:0 failed:0"
+    }
+
+2. CREATE SOME CLICKS:
+
+    # Login first, create a short URL, then click it multiple times:
+    for i in $(seq 1 20); do
+      curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
+    done
+
+3. WATCH THE WORKER:
+
+    docker compose logs app --tail 30
+
+    You should see:
+    [ClickWorker] Flushed 20 clicks to database
+
+    The worker batched all 20 clicks into one Postgres INSERT!
+
+4. CHECK QUEUE STATS:
+
+    curl http://localhost/api/queue/stats
+
+    Expected:
+    {
+      "queue": "clicks",
+      "counts": {
+        "active": 0,
+        "completed": 20,
+        "failed": 0,
+        "delayed": 0,
+        "waiting": 0
+      }
+    }
+
+5. CHECK REDIS FOR BULLMQ KEYS:
+
+    docker compose exec redis redis-cli
+    KEYS "bull:*"
+    # You'll see BullMQ's internal keys:
+    #   bull:clicks:id (job ID counter)
+    #   bull:clicks:completed (completed jobs set)
+    #   bull:clicks:meta (queue metadata)
+    #   bull:clicks:events (event stream)
+    EXIT
+
+6. VERIFY CLICKS IN DATABASE:
+
+    docker compose exec db psql -U dev tinyscale \
+      -c "SELECT count(*) FROM clicks;"
+
+    Should show 20 (or however many you clicked).
+
+7. TEST FAILURE HANDLING:
+
+    Stop the Postgres container while sending clicks:
+
+    # In terminal 1: Send clicks
+    for i in $(seq 1 10); do
+      curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
+      sleep 0.1
+    done
+
+    # In terminal 2: Watch the worker
+    docker compose logs -f app
+
+    # In terminal 3: Stop postgres
+    docker compose stop db
+
+    # The worker should log failures and retry.
+    # After restarting Postgres:
+    docker compose start db
+
+    # The retried jobs should succeed.
+
+
+================================================================================
+STEP 11: UNDERSTAND WHAT'S IN REDIS NOW
+================================================================================
+
+    docker compose exec redis redis-cli
+
+    DBSIZE
+    # Now you'll see many more keys than before
+
+    KEYS "cache:*"
+    # Your cache keys (url lookups, stats)
+
+    KEYS "bull:*"
+    # BullMQ's internal keys
+
+    KEYS "*rate*"
+    # Rate limiting keys
+
+    ZREVRANGE clicks:leaderboard 0 9 WITHSCORES
+    # Your real-time click leaderboard
+
+    INFO memory
+    # Check how much memory Redis is using now
+
+    EXIT
+
+
+================================================================================
+CHECKLIST BEFORE MOVING TO DAY 7
+================================================================================
+
+[ ] BullMQ installed
+[ ] Click queue created (click-queue.ts) with producer
+[ ] Click worker created (click-worker.ts) with batch processing
+[ ] Queue plugin created and registered (queue.plugin.ts)
+[ ] Redirect handler uses queue instead of direct DB insert
+[ ] Worker started in server.ts with graceful shutdown
+[ ] Dead letter monitor running
+[ ] Queue stats endpoint working (/api/queue/stats)
+[ ] Healthcheck shows queue status
+[ ] Tested: clicks flow through queue to database
+[ ] Tested: worker batches clicks (check logs for "Flushed N clicks")
+[ ] Understand: job queues, batching, retry, dead letter queue, graceful shutdown
+
+
+================================================================================
+================================================================================
+DAY 7: MEASURE THE IMPROVEMENT
+================================================================================
+================================================================================
+
+This is the most important day. You're going to PROVE that your changes
+made things faster with actual numbers. These numbers go on your resume.
+
+
+================================================================================
+STEP 1: UPDATE THE LOAD TEST
+================================================================================
+
+Your k6 load test from Week 2 (load-tests/basic.js) should still work.
+But let's make sure it's using the right BASE_URL and update it slightly.
+
+Open load-tests/basic.js and verify:
+- If running k6 locally: BASE_URL = 'http://localhost'
+- If running k6 in Docker: BASE_URL = 'http://nginx'
+
+Also, for the load test to work properly, temporarily increase Nginx
+rate limits. Open nginx/nginx.conf and change:
+
+    limit_req_zone $binary_remote_addr zone=api:10m rate=100r/s;
+    limit_req_zone $binary_remote_addr zone=login:10m rate=10r/s;
+
+And in the location blocks, increase burst:
+
+    limit_req zone=api burst=200 nodelay;
+    limit_req zone=login burst=20 nodelay;
+
+Restart Nginx:
+
+    docker compose restart nginx
+
+
+================================================================================
+STEP 2: RUN THE LOAD TEST (WITH REDIS + BULLMQ)
+================================================================================
+
+Make sure everything is up:
+
+    docker compose up -d
+    curl http://localhost/healthcheck
+
+Run the same load test from Week 2:
+
+    k6 run load-tests/basic.js
+
+OR with Docker:
+
+    docker run --rm -i --network tinyscale_tinyscale-network \
+      grafana/k6 run - < load-tests/basic.js
+
+While it runs, monitor in separate terminals:
+
+    Terminal 1: docker compose logs -f app
+    Terminal 2: docker stats
+    Terminal 3: docker compose exec redis redis-cli INFO stats
+                (look at instantaneous_ops_per_sec — Redis operations per second)
+
+
+================================================================================
+STEP 3: COMPARE THE NUMBERS
+================================================================================
+
+After the test, compare with your Week 2 results:
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │                    WEEK 2 RESULTS                            │
+    │     (No Redis, No BullMQ)                                   │
+    ├────────────────────┬─────────────────────────────────────────┤
+    │ Metric             │ Value (fill in from Week 2)             │
+    ├────────────────────┼─────────────────────────────────────────┤
+    │ Peak req/s         │ ___                                     │
+    │ p(95) latency      │ ___ ms                                  │
+    │ p(99) latency      │ ___ ms                                  │
+    │ Redirect p(95)     │ ___ ms                                  │
+    │ Error rate         │ ___%                                    │
+    │ Bottleneck         │ ___                                     │
+    └────────────────────┴─────────────────────────────────────────┘
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │                    WEEK 3 RESULTS                            │
+    │     (Redis caching + BullMQ background jobs)                │
+    ├────────────────────┬─────────────────────────────────────────┤
+    │ Metric             │ Value (fill in after test)              │
+    │ Peak req/s         │ ___                                     │
+    │ p(95) latency      │ ___ ms                                  │
+    │ p(99) latency      │ ___ ms                                  │
+    │ Redirect p(95)     │ ___ ms                                  │
+    │ Error rate         │ ___%                                    │
+    │ Bottleneck         │ ___                                     │
+    └────────────────────┴─────────────────────────────────────────┘
+
+EXPECTED IMPROVEMENTS:
+
+    1. REDIRECT LATENCY: Should drop significantly (maybe 2-10x faster)
+       Because: Cache hits skip Postgres entirely + clicks go to queue not DB
+
+    2. THROUGHPUT (req/s): Should increase (maybe 2-5x)
+       Because: Less Postgres load = more headroom for actual requests
+
+    3. ERROR RATE: Should decrease
+       Because: Queue absorbs burst traffic instead of overwhelming Postgres
+
+    4. BOTTLENECK: Should shift from "app CPU" or "DB connections"
+       to "Nginx rate limiting" or "Redis memory"
+       The bottleneck MOVED — that's progress!
+
+
+================================================================================
+STEP 4: MEASURE REDIS HIT RATE
+================================================================================
+
+This is a critical metric. If your cache hit rate is low, caching isn't helping.
+
+    docker compose exec redis redis-cli INFO stats
+
+Look for:
+    keyspace_hits: 1234
+    keyspace_misses: 56
+
+Hit rate = hits / (hits + misses) = 1234 / 1290 = 95.6%
+
+A good cache hit rate for URL redirects: > 90%
+If it's low, consider:
+    - Are your TTLs too short?
+    - Are most requests for unique URLs (cold cache)?
+    - Is your test creating too many unique URLs?
+
+
+================================================================================
+STEP 5: MEASURE QUEUE PERFORMANCE
+================================================================================
+
+During and after the load test, check queue metrics:
+
+    curl http://localhost/api/queue/stats
+
+Look at:
+    - waiting: jobs queued but not yet processed (should be low after test)
+    - active: jobs currently being processed
+    - completed: total jobs processed
+    - failed: total jobs that failed (should be 0 or very low)
+
+Also check:
+
+    docker compose exec redis redis-cli
+
+    # BullMQ processing rate
+    XLEN bull:clicks:events
+    # Number of events in the BullMQ event stream
+
+    # Click leaderboard
+    ZREVRANGE clicks:leaderboard 0 4 WITHSCORES
+    # Top 5 most clicked URLs
+
+    # Memory usage
+    INFO memory
+    # used_memory_human shows total Redis memory usage
+
+    EXIT
+
+
+================================================================================
+STEP 6: DOCUMENT YOUR RESULTS
+================================================================================
+
+Update load-tests/results.md with Week 3 results:
+
+    ## Week 3 Results — Redis Caching + BullMQ
+
+    ### Setup
+    - Same load profile as Week 2
+    - Added: Redis caching (cache-aside, 1hr TTL for redirects, 60s for stats)
+    - Added: BullMQ click processing (batch inserts of 50)
+    - Added: Redis-backed rate limiting
+
+    ### Results
+    | Metric              | Week 2          | Week 3          | Improvement  |
+    |---------------------|-----------------|-----------------|--------------|
+    | Peak req/s          | ___             | ___             | ___x faster  |
+    | Redirect p(95)      | ___ ms          | ___ ms          | ___x faster  |
+    | Overall p(95)       | ___ ms          | ___ ms          | ___x faster  |
+    | Error rate          | ___%            | ___%            | ___          |
+    | Redis hit rate      | N/A             | ___%            |              |
+    | Queue throughput    | N/A             | ___ jobs/sec    |              |
+
+    ### Key Observations
+    1. [What improved the most?]
+    2. [Where is the new bottleneck?]
+    3. [Any unexpected behavior?]
+
+    ### Architecture Now
+    User → Nginx:80 → App:3000 → Redis (cache check)
+                                    ├─ HIT → redirect immediately
+                                    └─ MISS → Postgres → cache in Redis → redirect
+
+    Click recording:
+    App → BullMQ queue (Redis) → Worker → Batch INSERT → Postgres
+
+    ### Resume Line
+    "Improved URL redirect latency by Xx with Redis caching (95% hit rate)
+    and increased throughput by Xx with BullMQ background job processing,
+    handling N req/s on a single machine."
+
+
+================================================================================
+STEP 7: RESTORE NGINX RATE LIMITS
+================================================================================
+
+Don't forget to restore the original Nginx rate limits after load testing:
+
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=login:10m rate=3r/s;
+
+And burst values:
+
+    limit_req zone=api burst=20 nodelay;
+    limit_req zone=login burst=5 nodelay;
+
+Restart Nginx:
+
+    docker compose restart nginx
+
+
+================================================================================
+BONUS: THINGS TO EXPERIMENT WITH (DO AT LEAST 2)
+================================================================================
+
+1. KILL REDIS WHILE THE APP IS RUNNING:
+
+    docker compose stop redis
+
+    Then try redirecting:
+    curl -v http://localhost/YOUR_SHORT_CODE
+
+    Does the app still work? (It should — graceful degradation)
+    It just falls through to Postgres (slower but functional).
+
+    docker compose start redis
+    # Cache starts building again
+
+2. CHANGE THE BATCH SIZE:
+
+    In click-worker.ts, change BATCH_SIZE from 50 to 1.
+    Rebuild and rerun the load test.
+    Compare performance — you'll see batching matters!
+
+3. WATCH REDIS IN REAL-TIME:
+
+    docker compose exec redis redis-cli MONITOR
+
+    This shows EVERY command Redis receives in real-time.
+    Now hit your API — you'll see GET, SET, LPUSH commands flying by.
+    Press Ctrl+C to stop. DON'T leave MONITOR on in production — it's expensive.
+
+4. SIMULATE A SLOW DATABASE:
+
+    docker compose exec db psql -U dev tinyscale \
+      -c "SELECT pg_sleep(2);"
+
+    This makes Postgres wait 2 seconds. Now try a redirect.
+    First request (cache miss) will be slow.
+    Second request (cache hit) will be fast.
+    This demonstrates exactly why caching matters.
+
+5. CHECK WHAT BULLMQ STORES IN REDIS:
+
+    docker compose exec redis redis-cli
+
+    # Look at a completed job
+    KEYS "bull:clicks:*"
+
+    # Check the job data
+    TYPE "bull:clicks:1"
+    HGETALL "bull:clicks:1"
+    # You'll see the full job data, attempts, timestamps, etc.
+
+    EXIT
+
+
+================================================================================
+FINAL CHECKLIST — WEEK 3 COMPLETE
+================================================================================
+
+DAY 1-2 (Redis Fundamentals):
+[ ] Redis running in Docker with healthcheck and memory limit
+[ ] ioredis installed and Redis plugin created
+[ ] Explored all key Redis data structures (strings, hashes, lists, sets, sorted sets)
+[ ] Understand: why Redis is fast, TTL, LRU eviction, persistence
+
+DAY 3-4 (Caching):
+[ ] Cache service implemented (cache-aside pattern)
+[ ] Redirect lookups cached in Redis (1 hour TTL)
+[ ] Stats queries cached in Redis (60 second TTL)
+[ ] Rate limiting moved from in-memory to Redis
+[ ] Click counter leaderboard using sorted sets
+[ ] Cache invalidation working (on URL expiry, on new clicks)
+[ ] Graceful degradation — app works if Redis is down
+
+DAY 5-6 (Background Jobs):
+[ ] BullMQ installed and configured
+[ ] Click queue producer created
+[ ] Click worker with batch processing created
+[ ] Dead letter queue monitoring
+[ ] Queue stats endpoint (/api/queue/stats)
+[ ] Redirect handler uses queue (not direct DB insert)
+[ ] Graceful shutdown flushes remaining clicks
+[ ] Verified batch inserts in logs
+
+DAY 7 (Measurement):
+[ ] Load test run with Redis + BullMQ
+[ ] Results compared with Week 2 baseline
+[ ] Redis hit rate measured
+[ ] Queue performance measured
+[ ] Results documented with actual numbers
+[ ] At least 2 experiments completed
+
+>> WEEK 3 CHECKPOINT: <<
+Redis caching + async job processing working.
+Measurable performance improvement documented.
+You can explain cache-aside pattern, TTL, cache invalidation,
+job queues, batching, retry logic, and dead letter queues.
+
+>> YOUR SYSTEM NOW LOOKS LIKE: <<
+
+    User → Nginx (rate limit, gzip, SSL)
+             ↓
+           App:3000
+             ├─ Redis (cache check for redirect)
+             │    ├─ HIT → redirect (sub-millisecond)
+             │    └─ MISS → Postgres → cache → redirect
+             ├─ Redis (rate limit counters, shared across instances)
+             ├─ Redis (click queue via BullMQ)
+             │    └─ Worker → batch INSERT → Postgres
+             └─ Postgres (source of truth)
+
+When done, message: "Week 3 done, ready for Week 4"
+Week 4: Go Basics + CLI Tool + Monitoring (Prometheus + Grafana)
+================================================================================

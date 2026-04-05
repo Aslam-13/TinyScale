@@ -10,6 +10,7 @@ services:
     environment:
       DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
       JWT_SECRET: docker-dev-secret-change-in-production
+      REDIS_URL: redis://redis:6379
       PORT: 3000
       HOST: 0.0.0.0
       NODE_ENV: production
@@ -18,6 +19,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     networks:
       - tinyscale-network
     restart: unless-stopped
@@ -77,9 +80,32 @@ services:
     networks:
       - tinyscale-network
 
+  # Redis Cache 
+  redis:
+    image: redis:7-alpine
+    # Redis 7 on Alpine Linux — small and fast
+    ports:
+      - "6379:6379"
+      # 6379 is Redis's default port
+      # Mapping to host so you can use redis-cli from your machine
+    volumes:
+      - redisdata:/data
+      # Redis can persist data to disk (RDB snapshots / AOF log)
+      # /data is where Redis saves its dump.rdb file
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      # redis-cli ping should return PONG if Redis is healthy
+    networks:
+      - tinyscale-network
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+
 # ---- VOLUMES ----
 volumes:
   pgdata:
+  redisdata:
     # This creates a Docker-managed volume on your machine.
     # Even if you `docker-compose down`, data stays.
     # To DELETE data: docker-compose down -v (the -v flag removes volumes)

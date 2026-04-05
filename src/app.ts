@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import { dbPlugin } from "./plugins/db.plugin.js";
+import { redisPlugin } from "./plugins/redis.plugin.js";
 import { authPlugin } from "./plugins/auth.plugin.js";
 import { rateLimitPlugin } from "./plugins/rate-limit.plugin.js";
 import { registerErrorHandler } from "./errors/error-handler.js";
@@ -22,6 +23,7 @@ export async function buildApp(opts: BuildAppOptions = {}) {
 
   // Plugins (order matters)
   await app.register(dbPlugin);
+  await app.register(redisPlugin);
   await app.register(authPlugin);
   await app.register(rateLimitPlugin);
 
@@ -37,8 +39,20 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   });
 
   // Healthcheck
-  app.get("/healthcheck", async () => {
-    return { status: "ok" };
+  app.get("/healthcheck", async (request) => {
+    // Check Redis connectivity
+    let redisStatus = "disconnected";
+    try {
+      const pong = await request.server.redis.ping();
+      redisStatus = pong === "PONG" ? "connected" : "error";
+    } catch {
+      redisStatus = "error";
+    }
+
+    return {
+      status: "ok",
+      redis: redisStatus,
+    };
   });
 
   // Routes

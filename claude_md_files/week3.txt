@@ -1207,14 +1207,14 @@ Wait for all services to start, then test the full flow:
 
     curl -X POST http://localhost/api/shorten \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer YOUR_TOKEN" \
+      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJiZmY3NzFkOS0yMWJjLTQ0NTktYWNlYy0wNmFmMWFhNjg0ZjIiLCJpYXQiOjE3NzU0MDg0MTAsImV4cCI6MTc3NjAxMzIxMH0.MNopR_2X2PJrcpkuIuM7f4nq8aHAd94oPv2WRN7fYeI" \
       -d '{"url":"https://www.google.com"}'
 
     Note the shortCode (e.g., "Ax7bK2").
 
 4. FIRST REDIRECT (CACHE MISS):
 
-    curl -v http://localhost/YOUR_SHORT_CODE 2>&1 | head -20
+    curl -v http://localhost/5hMvfNyN 2>&1 | head -20
 
     This hits Postgres (cache miss) and stores the result in Redis.
 
@@ -1225,17 +1225,17 @@ Wait for all services to start, then test the full flow:
     KEYS *
     # You should see: "cache:url:YOUR_SHORT_CODE"
 
-    GET "cache:url:YOUR_SHORT_CODE"
+    GET "cache:url:5hMvfNyN"
     # Returns the JSON-serialized URL object
 
-    TTL "cache:url:YOUR_SHORT_CODE"
+    TTL "cache:url:5hMvfNyN"
     # Returns ~3600 (seconds remaining)
 
     EXIT
 
 6. SECOND REDIRECT (CACHE HIT):
 
-    curl -v http://localhost/YOUR_SHORT_CODE 2>&1 | head -20
+    curl -v http://localhost/5hMvfNyN 2>&1 | head -20
 
     This time it hits Redis (cache hit) — should be noticeably faster.
     Check the app logs to see "Cache HIT" vs "Cache MISS":
@@ -1245,9 +1245,9 @@ Wait for all services to start, then test the full flow:
 7. TEST THE CLICK LEADERBOARD:
 
     # Click the same URL a few times
-    curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
-    curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
-    curl -s http://localhost/YOUR_SHORT_CODE > /dev/null
+    curl -s http://localhost/5hMvfNyN > /dev/null
+    curl -s http://localhost/5hMvfNyN > /dev/null
+    curl -s http://localhost/5hMvfNyN > /dev/null
 
     docker compose exec redis redis-cli
 
@@ -1258,14 +1258,16 @@ Wait for all services to start, then test the full flow:
 
 8. TEST STATS CACHING:
 
-    curl http://localhost/api/stats/YOUR_SHORT_CODE \
-      -H "Authorization: Bearer YOUR_TOKEN"
-
+    curl http://localhost/api/stats/5hMvfNyN \
+      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJiZmY3NzFkOS0yMWJjLTQ0NTktYWNlYy0wNmFmMWFhNjg0ZjIiLCJpYXQiOjE3NzU0MDkwMDksImV4cCI6MTc3NjAxMzgwOX0.wFoHiTBEh09lHi3lXhpqz_3sY0lAcmYSusHG2dCsM_I"
+curl -X POST http://localhost/api/auth/login \
+       -H "Content-Type: application/json" \
+       -d '{"email":"redis-test@test.com","password":"test1234"}'
     # First call: cache miss (hits Postgres, 4 queries)
     # Second call within 60 seconds: cache hit (from Redis, 0 queries)
 
-    curl http://localhost/api/stats/YOUR_SHORT_CODE \
-      -H "Authorization: Bearer YOUR_TOKEN"
+    curl http://localhost/api/stats/5hMvfNyN \
+      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJiZmY3NzFkOS0yMWJjLTQ0NTktYWNlYy0wNmFmMWFhNjg0ZjIiLCJpYXQiOjE3NzU0MDkwMDksImV4cCI6MTc3NjAxMzgwOX0.wFoHiTBEh09lHi3lXhpqz_3sY0lAcmYSusHG2dCsM_I"
 
     Check Redis:
 

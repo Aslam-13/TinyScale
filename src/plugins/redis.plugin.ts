@@ -1,6 +1,6 @@
 import fp from "fastify-plugin";
 import { type FastifyInstance } from "fastify";
-import Redis from "ioredis";
+import { Redis } from "ioredis";
 import { env } from "../config/env.js";
 
 // Extend Fastify's type system so app.redis is available everywhere

@@ -33,7 +33,7 @@ export async function redirectHandler(
   const url = await resolveShortCode(request.server, request.params.code);
 
   // Fire-and-forget click recording — don't await, redirect is the hot path
-  recordClick(request.server, url.id, {
+  recordClick(request.server, url.id, url.shortCode, {
     referrer: request.headers.referer ?? request.headers.referrer as string | undefined,
     userAgent: request.headers["user-agent"],
     ip: request.ip,

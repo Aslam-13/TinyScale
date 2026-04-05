@@ -3,6 +3,7 @@ import { type FastifyInstance } from "fastify";
 import { urls, clicks } from "../../db/schema/index.js";
 import { generateShortCode } from "../../utils/short-code.js";
 import { NotFoundError, ConflictError } from "../../errors/http-errors.js";
+import { cacheGet, cacheInvalidate } from "../../services/cache.service.js";
 
 const MAX_COLLISION_RETRIES = 5;
 
@@ -43,11 +44,21 @@ export async function createShortUrl(
 }
 
 export async function resolveShortCode(app: FastifyInstance, code: string) {
-  const [url] = await app.db
-    .select()
-    .from(urls)
-    .where(eq(urls.shortCode, code))
-    .limit(1);
+  // Cache-aside: check Redis first, then Postgres
+  const url = await cacheGet(
+    app,
+    `url:${code}`,
+    async () => {
+      const [result] = await app.db
+        .select()
+        .from(urls)
+        .where(eq(urls.shortCode, code))
+        .limit(1);
+
+      return result ?? null;
+    },
+    3600 // 1 hour — URLs rarely change
+  );
 
   if (!url) {
     throw new NotFoundError("Short URL not found");
@@ -55,6 +66,8 @@ export async function resolveShortCode(app: FastifyInstance, code: string) {
 
   // Check expiration
   if (url.expiresAt && new Date(url.expiresAt) < new Date()) {
+    // URL expired — invalidate cache so we don't keep serving it
+    await cacheInvalidate(app, `url:${code}`);
     throw new NotFoundError("Short URL has expired");
   }
 
@@ -64,12 +77,23 @@ export async function resolveShortCode(app: FastifyInstance, code: string) {
 export async function recordClick(
   app: FastifyInstance,
   urlId: string,
+  shortCode: string,
   meta: { referrer?: string; userAgent?: string; ip?: string }
 ) {
+  // Write click to Postgres (source of truth)
   await app.db.insert(clicks).values({
     urlId,
     referrer: meta.referrer ?? null,
     userAgent: meta.userAgent ?? null,
     ip: meta.ip ?? null,
   });
+
+  // Increment real-time click leaderboard in Redis + invalidate stats cache
+  try {
+    await app.redis.zincrby("clicks:leaderboard", 1, shortCode);
+    await app.redis.del(`cache:stats:${shortCode}`);
+  } catch (err) {
+    // Redis failure is non-fatal — Postgres has the data
+    app.log.warn(err, "Redis click counter update failed");
+  }
 }

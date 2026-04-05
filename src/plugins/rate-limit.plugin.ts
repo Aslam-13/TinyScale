@@ -13,5 +13,8 @@ export const rateLimitPlugin = fp(async (fastify: FastifyInstance) => {
       if (typeof apiKey === "string") return apiKey;
       return request.ip;
     },
+    // Use Redis as the backing store so all app instances share counters.
+    // Without this, 3 app replicas = 3x the intended limit.
+    redis: fastify.redis,
   });
 });

@@ -4,11 +4,13 @@ import { dbPlugin } from "./plugins/db.plugin.js";
 import { redisPlugin } from "./plugins/redis.plugin.js";
 import { authPlugin } from "./plugins/auth.plugin.js";
 import { rateLimitPlugin } from "./plugins/rate-limit.plugin.js";
+import { queuePlugin } from "./plugins/queue.plugin.js";
 import { registerErrorHandler } from "./errors/error-handler.js";
 import { authRoutes } from "./modules/auth/auth.routes.js";
 import { urlRoutes } from "./modules/url/url.routes.js";
 import { statsRoutes } from "./modules/stats/stats.routes.js";
 import { apiKeyAuth } from "./middleware/api-key-auth.js";
+import { workerStats } from "./jobs/click-worker.js";
 
 export interface BuildAppOptions {
   logger?: boolean | object;
@@ -24,6 +26,7 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   // Plugins (order matters)
   await app.register(dbPlugin);
   await app.register(redisPlugin);
+  await app.register(queuePlugin);
   await app.register(authPlugin);
   await app.register(rateLimitPlugin);
 
@@ -40,7 +43,6 @@ export async function buildApp(opts: BuildAppOptions = {}) {
 
   // Healthcheck
   app.get("/healthcheck", async (request) => {
-    // Check Redis connectivity
     let redisStatus = "disconnected";
     try {
       const pong = await request.server.redis.ping();
@@ -49,9 +51,37 @@ export async function buildApp(opts: BuildAppOptions = {}) {
       redisStatus = "error";
     }
 
+    let queueStatus = "unknown";
+    try {
+      const counts = await request.server.clickQueue.getJobCounts("waiting", "active", "failed");
+      queueStatus = `waiting:${counts.waiting} active:${counts.active} failed:${counts.failed}`;
+    } catch {
+      queueStatus = "error";
+    }
+
     return {
       status: "ok",
       redis: redisStatus,
+      queue: queueStatus,
+    };
+  });
+
+  // Queue monitoring (admin only in production — fine for dev)
+  app.get("/api/queue/stats", async (request) => {
+    const counts = await request.server.clickQueue.getJobCounts(
+      "active",
+      "completed",
+      "failed",
+      "delayed",
+      "waiting"
+    );
+
+    return {
+      queue: "clicks",
+      // BullMQ's view — "did the job enter the buffer?"
+      bullmq: counts,
+      // Worker's view — "did the clicks actually reach Postgres?"
+      worker: workerStats,
     };
   });
 

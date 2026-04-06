@@ -1,5 +1,5 @@
 import { type FastifyRequest, type FastifyReply } from "fastify";
-import { createShortUrl, resolveShortCode, recordClick } from "./url.service.js";
+import { createShortUrl, resolveShortCode } from "./url.service.js";
 import type { ShortenBody, RedirectParams } from "./url.schema.js";
 import { env } from "../../config/env.js";
 
@@ -32,12 +32,18 @@ export async function redirectHandler(
 ) {
   const url = await resolveShortCode(request.server, request.params.code);
 
-  // Fire-and-forget click recording — don't await, redirect is the hot path
-  recordClick(request.server, url.id, url.shortCode, {
-    referrer: request.headers.referer ?? request.headers.referrer as string | undefined,
-    userAgent: request.headers["user-agent"],
-    ip: request.ip,
-  }).catch((err) => request.log.error(err, "Failed to record click"));
+  // Push click to BullMQ queue — worker will batch-insert to Postgres later
+  request.server.clickQueue
+    .add("click", {
+      urlId: url.id,
+      shortCode: url.shortCode,
+      referrer: request.headers.referer ?? (request.headers.referrer as string | undefined) ?? null,
+      userAgent: request.headers["user-agent"] ?? null,
+      ip: request.ip ?? null,
+      clickedAt: new Date().toISOString(),
+    })
+    .catch((err) => request.log.error(err, "Failed to enqueue click"));
 
+  // Redirect immediately — don't wait for the queue
   return reply.redirect(url.originalUrl);
 }

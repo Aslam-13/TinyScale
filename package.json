@@ -26,6 +26,7 @@
     "@fastify/type-provider-typebox": "^6.1.0",
     "@sinclair/typebox": "^0.34.48",
     "bcrypt": "^6.0.0",
+    "bullmq": "^5.73.0",
     "dotenv": "^17.2.4",
     "drizzle-orm": "^0.45.1",
     "fastify": "^5.7.4",

@@ -80,20 +80,11 @@ export async function recordClick(
   shortCode: string,
   meta: { referrer?: string; userAgent?: string; ip?: string }
 ) {
-  // Write click to Postgres (source of truth)
+  // Direct insert — used only for testing or as a fallback
   await app.db.insert(clicks).values({
     urlId,
     referrer: meta.referrer ?? null,
     userAgent: meta.userAgent ?? null,
     ip: meta.ip ?? null,
   });
-
-  // Increment real-time click leaderboard in Redis + invalidate stats cache
-  try {
-    await app.redis.zincrby("clicks:leaderboard", 1, shortCode);
-    await app.redis.del(`cache:stats:${shortCode}`);
-  } catch (err) {
-    // Redis failure is non-fatal — Postgres has the data
-    app.log.warn(err, "Redis click counter update failed");
-  }
 }

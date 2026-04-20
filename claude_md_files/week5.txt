@@ -1,0 +1,2512 @@
+================================================================================
+                    WEEK 5: KAFKA + EVENT-DRIVEN ARCHITECTURE
+                    ==========================================
+                    Your Goal: Replace BullMQ with Kafka for
+                    the analytics pipeline. Understand why
+                    distributed messaging matters and how
+                    event-driven systems work at scale.
+================================================================================
+
+
+================================================================================
+DAY 1-2: KAFKA CONCEPTS + LOCAL SETUP
+================================================================================
+
+BEFORE YOU TOUCH ANY CODE - READ AND UNDERSTAND THIS:
+------------------------------------------------------
+
+>> WHY ARE WE REPLACING BULLMQ? <<
+
+BullMQ works. Your click tracking works. So why change it?
+
+Because BullMQ has fundamental limitations that show up at scale:
+
+1. BULLMQ IS TIED TO REDIS:
+   Your click events live in Redis memory. If Redis restarts and you
+   haven't configured AOF persistence, those events are GONE.
+   In Week 3, we accepted that risk because Redis was "just a cache."
+   But click events are business data — you can't afford to lose them.
+
+2. BULLMQ IS ONE-TO-ONE:
+   One job is consumed by ONE worker. Once consumed, it's gone.
+   What if you want TWO things to happen for every click?
+   - Write to Postgres (what you do now)
+   - Aggregate hourly stats (new requirement)
+   - Send to an analytics data warehouse (future requirement)
+   With BullMQ, you'd need to either:
+   - Do all three in the same worker (tight coupling)
+   - Duplicate the event into three queues (fragile)
+
+3. BULLMQ CAN'T REPLAY EVENTS:
+   What if your analytics consumer had a bug and miscounted clicks
+   for the last 3 days? With BullMQ, those events are gone after
+   processing. You'd have to re-derive from Postgres.
+   With Kafka, you can replay events from any point in time.
+
+4. BULLMQ DOESN'T SCALE HORIZONTALLY WELL:
+   Want to process 100K events/sec? Redis becomes the bottleneck.
+   Kafka is designed for millions of events per second across
+   multiple brokers.
+
+>> WHAT IS KAFKA? <<
+
+Kafka is a DISTRIBUTED EVENT STREAMING PLATFORM.
+
+Don't let the fancy name scare you. At its core, Kafka is:
+
+    A durable, ordered, replayable log of events.
+
+That's it. Events go in, and any number of consumers can read them
+at their own pace, from any point in the log.
+
+Think of it like a newspaper:
+- BullMQ = a mailbox. One letter, one reader. Once read, it's gone.
+- Kafka = a newspaper archive. Published once, anyone can read it,
+  and you can go back and re-read last Tuesday's edition.
+
+
+>> KAFKA vs BULLMQ vs REDIS — THE FULL COMPARISON <<
+
+    Feature                  BullMQ/Redis           Kafka
+    ───────                  ────────────           ─────
+    Storage                  In-memory (RAM)        On disk (durable)
+    Durability               Lossy on restart*      Survives restarts
+    Delivery model           Job queue (1-to-1)     Pub/sub (1-to-many)
+    Replay                   No (consumed = gone)   Yes (offset-based)
+    Ordering                 Per queue (FIFO)       Per partition (FIFO)
+    Throughput               ~50K msgs/sec          ~1M+ msgs/sec
+    Consumer groups          No (1 worker pool)     Yes (multiple groups)
+    Scaling                  Vertical (bigger Redis) Horizontal (add brokers)
+    Message retention        Until consumed          Configurable (days/forever)
+    Best for                 Background jobs         Event streaming
+    Complexity               Low                    Medium-High
+
+    * Redis AOF can reduce data loss but adds latency and isn't the
+      same as Kafka's replication guarantees.
+
+RULE: BullMQ is great for "do this task later." Kafka is great for
+"this event happened, and many things need to react to it."
+
+Your click tracking is an EVENT, not a TASK. Multiple consumers
+need to react differently to the same click. That's Kafka's sweet spot.
+
+
+>> KAFKA CORE CONCEPTS - UNDERSTAND THESE BEFORE PROCEEDING <<
+
+You MUST understand these 6 concepts. Read each one carefully.
+
+
+1. TOPICS
+---------
+
+A topic is a named stream of events. Think of it like a database table,
+but append-only.
+
+    Topic: "clicks"
+    ┌──────────────────────────────────────┐
+    │ Event 1: {urlId: "abc", ip: "1.2.."}│
+    │ Event 2: {urlId: "def", ip: "3.4.."}│
+    │ Event 3: {urlId: "abc", ip: "5.6.."}│
+    │ Event 4: {urlId: "ghi", ip: "7.8.."}│
+    │ ...                                  │
+    └──────────────────────────────────────┘
+
+Events are NEVER deleted from the topic (until retention expires).
+Default retention: 7 days. You can set it to forever.
+
+COMPARISON TO WHAT YOU KNOW:
+    BullMQ queue name "clicks"  →  Kafka topic "clicks"
+    The difference: BullMQ deletes jobs after processing.
+    Kafka keeps them for the configured retention period.
+
+
+2. PARTITIONS
+-------------
+
+A topic is split into PARTITIONS. Each partition is an ordered,
+immutable sequence of events.
+
+    Topic: "clicks" (3 partitions)
+
+    Partition 0: [Event 0] [Event 3] [Event 6] [Event 9]  ...
+    Partition 1: [Event 1] [Event 4] [Event 7] [Event 10] ...
+    Partition 2: [Event 2] [Event 5] [Event 8] [Event 11] ...
+
+WHY PARTITIONS?
+- PARALLELISM: Each partition can be consumed by a different consumer.
+  3 partitions = up to 3 consumers processing in parallel.
+- ORDERING: Events within a partition are strictly ordered.
+  Events ACROSS partitions have no ordering guarantee.
+
+HOW DOES KAFKA DECIDE WHICH PARTITION?
+- If you provide a KEY with the event, Kafka hashes the key and
+  routes to a consistent partition. Same key = same partition = same order.
+- If no key, Kafka round-robins across partitions.
+
+FOR TINYSCALE:
+    We'll use the urlId as the partition key.
+    This means ALL clicks for the same URL go to the same partition.
+    Why? Because Consumer 2 (hourly aggregator) needs to count clicks
+    per URL. If clicks for the same URL are spread across partitions,
+    aggregation becomes much harder.
+
+COMPARISON TO WHAT YOU KNOW:
+    BullMQ concurrency: 10  →  you have 10 workers in ONE process.
+    Kafka partitions: 10    →  you can have 10 SEPARATE consumers.
+    This is fundamentally different. Kafka scales OUT, BullMQ scales UP.
+
+
+3. OFFSETS
+----------
+
+Every event in a partition has a sequential number called an OFFSET.
+
+    Partition 0:
+    Offset:  0     1     2     3     4     5
+    Event: [Click][Click][Click][Click][Click][Click]
+                              ^
+                              Consumer A is here (offset 3)
+
+The offset is how a consumer tracks its position. It's like a bookmark.
+
+- When a consumer reads events, it moves its offset forward.
+- If a consumer crashes and restarts, it resumes from its last
+  COMMITTED offset (saved in Kafka).
+- If you want to replay events, you reset the offset back.
+
+COMPARISON TO WHAT YOU KNOW:
+    BullMQ: Worker picks up a job → job is removed from queue.
+            If worker crashes mid-processing, BullMQ retries
+            (job goes back to queue, "stalled" event).
+    Kafka:  Consumer reads event → moves offset forward.
+            If consumer crashes, offset stays at last commit.
+            Event is STILL IN THE LOG — nothing is removed.
+
+THIS IS THE KEY DIFFERENCE. Kafka consumers don't consume events —
+they READ events. The events stay put. The consumer just moves its
+bookmark.
+
+
+4. CONSUMER GROUPS
+------------------
+
+A consumer group is a team of consumers that SHARE the work of
+reading from a topic.
+
+    Topic: "clicks" (3 partitions)
+
+    Consumer Group: "click-writer" (writes to Postgres)
+        Consumer A → reads Partition 0
+        Consumer B → reads Partition 1
+        Consumer C → reads Partition 2
+
+    Consumer Group: "click-aggregator" (hourly stats)
+        Consumer D → reads Partition 0
+        Consumer E → reads Partition 1 + 2
+
+RULES:
+- Within a group, each partition is read by EXACTLY one consumer.
+- Different groups read ALL partitions independently.
+- Each group maintains its own offsets.
+
+This is how Kafka solves the "multiple things react to same event" problem:
+- Consumer Group "click-writer" processes every click → writes to Postgres
+- Consumer Group "click-aggregator" processes every click → aggregates stats
+
+Both groups see EVERY event. Within each group, the work is split
+across consumers. This is 1-to-many delivery that BullMQ can't do.
+
+WHAT HAPPENS WHEN A CONSUMER CRASHES?
+    Consumer Group: "click-writer" (3 consumers, 3 partitions)
+        Consumer A → Partition 0
+        Consumer B → Partition 1
+        Consumer C → Partition 2  ← Consumer C crashes!
+
+    REBALANCE:
+        Consumer A → Partition 0
+        Consumer B → Partition 1 + Partition 2  ← B picks up C's work
+
+    When C comes back:
+        Consumer A → Partition 0
+        Consumer B → Partition 1
+        Consumer C → Partition 2  ← back to normal
+
+This is called CONSUMER GROUP REBALANCING. It happens automatically.
+During rebalancing, consumption pauses briefly (a few seconds).
+
+WHAT HAPPENS WHEN YOU HAVE MORE CONSUMERS THAN PARTITIONS?
+    Topic: "clicks" (3 partitions)
+    Consumer Group: "click-writer" (4 consumers)
+        Consumer A → Partition 0
+        Consumer B → Partition 1
+        Consumer C → Partition 2
+        Consumer D → IDLE (no partition to read)
+
+    Consumer D sits there doing nothing. It's a spare.
+    If any of A/B/C crash, D picks up the orphaned partition.
+
+RULE: Number of consumers in a group <= number of partitions.
+      More consumers than partitions = wasted resources.
+      This is why partition count matters. Plan it based on expected
+      parallelism.
+
+
+5. PRODUCERS
+------------
+
+A producer sends events to a topic. That's it.
+
+    Producer → Topic "clicks" (Kafka decides partition based on key)
+
+A producer doesn't know or care about consumers. It just writes events.
+This is DECOUPLING — the producer and consumers are completely independent.
+
+COMPARISON:
+    BullMQ: queue.add("click", data)  →  produces a job
+    Kafka:  producer.send({ topic, messages })  →  produces an event
+
+Almost identical API. The difference is what happens AFTER.
+
+
+6. BROKERS (FOR UNDERSTANDING — WE'LL USE ONE LOCALLY)
+------------------------------------------------------
+
+A Kafka broker is a server that stores topic partitions.
+
+In production, you'd have 3-5+ brokers:
+    Broker 1: Partition 0 (leader), Partition 1 (replica)
+    Broker 2: Partition 1 (leader), Partition 2 (replica)
+    Broker 3: Partition 2 (leader), Partition 0 (replica)
+
+Each partition has a LEADER (handles reads/writes) and REPLICAS
+(backups on other brokers). If a broker dies, a replica is promoted.
+
+For local development, we'll run a SINGLE broker. That's fine.
+
+
+>> KRAFT MODE - NO ZOOKEEPER <<
+
+Older Kafka tutorials mention "Zookeeper" — a separate service that
+managed Kafka's cluster metadata. Since Kafka 3.3, this is replaced
+by KRaft (Kafka Raft). Kafka manages its own metadata internally.
+
+Why this matters to you: One less service to run. Our Docker setup
+will be simpler than older tutorials you'll find online.
+
+If you see tutorials telling you to run Zookeeper: they're outdated.
+Skip them and use KRaft mode.
+
+
+================================================================================
+STEP 1: ADD KAFKA TO DOCKER-COMPOSE
+================================================================================
+
+Open your docker-compose.yml and add the Kafka service.
+
+Add this block to the `services:` section (after the redis service):
+
+    # ---- KAFKA (event streaming) ----
+    kafka:
+      image: confluentinc/cp-kafka:7.6.0
+      # Confluent Platform Kafka — the standard Docker image for Kafka.
+      # We use Confluent's image, not Apache's, because:
+      # 1. It's pre-configured for KRaft mode (no Zookeeper)
+      # 2. It includes useful tools (kafka-topics, kafka-console-producer, etc.)
+      # 3. It's what most companies use in production
+      hostname: kafka
+      ports:
+        - "9092:9092"
+        # 9092 = Kafka's default port
+        # We expose it so you can use kcat from your host machine
+        - "9101:9101"
+        # 9101 = JMX metrics port (for monitoring — optional)
+      environment:
+        # ---- KRaft mode (no Zookeeper) ----
+        KAFKA_NODE_ID: 1
+        # Unique ID for this broker. In a multi-broker setup, each gets a different ID.
+
+        KAFKA_PROCESS_ROLES: broker,controller
+        # This node acts as BOTH broker (handles data) and controller (handles metadata).
+        # In production, you'd separate these roles across different nodes.
+
+        KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+        # The controller quorum — which nodes vote on metadata changes.
+        # Format: nodeId@host:port. We only have one node (ID 1).
+
+        KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+        # Three listeners:
+        # PLAINTEXT://29092 — for inter-broker communication (other containers use this)
+        # CONTROLLER://9093 — for KRaft controller communication
+        # PLAINTEXT_HOST://9092 — for external access (your host machine)
+
+        KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+        # What Kafka TELLS clients to connect to.
+        # Containers connect to kafka:29092 (Docker DNS).
+        # Your host machine connects to localhost:9092.
+
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+        # All listeners use PLAINTEXT (no SSL). Fine for local dev.
+
+        KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+        KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+        KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+        # How many copies of the __consumer_offsets topic.
+        # In production: 3. Locally: 1 (we only have one broker).
+
+        KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+        KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+        # Same — single-broker settings. Don't touch these.
+
+        KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        # Don't wait for more consumers before the first rebalance.
+        # In production, you'd set 3000ms to avoid unnecessary rebalancing
+        # during rolling deploys. Locally, 0 for fast startup.
+
+        KAFKA_LOG_RETENTION_HOURS: 168
+        # Keep events for 7 days (168 hours).
+        # After 7 days, old segments are deleted.
+        # In production, you might keep 30 days or forever.
+
+        CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+        # Pre-generated cluster ID for KRaft mode.
+        # Required so Kafka can format its log directory on first start.
+        # Generate your own with: kafka-storage random-uuid
+        # But this static one is fine for local dev.
+      volumes:
+        - kafkadata:/var/lib/kafka/data
+        # Kafka stores topic data here. Persist across restarts.
+      networks:
+        - tinyscale-network
+      healthcheck:
+        test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 | grep -c ApiVersion || exit 1"]
+        interval: 10s
+        timeout: 10s
+        retries: 5
+        start_period: 30s
+        # Kafka takes ~15-30 seconds to start. start_period gives it time
+        # before Docker starts counting failed healthchecks.
+      restart: unless-stopped
+
+    # ---- KAFKA TOPIC SETUP (runs once) ----
+    kafka-init:
+      image: confluentinc/cp-kafka:7.6.0
+      depends_on:
+        kafka:
+          condition: service_healthy
+      networks:
+        - tinyscale-network
+      command: >
+        bash -c "
+          echo 'Creating Kafka topics...' &&
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic clicks --partitions 3 --replication-factor 1 &&
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic clicks-dlq --partitions 1 --replication-factor 1 &&
+          echo 'Topics created:' &&
+          kafka-topics --bootstrap-server kafka:29092 --list
+        "
+      # This container starts, creates the topics, then exits.
+      # --if-not-exists = don't error if topic already exists (idempotent).
+      # clicks: 3 partitions — allows up to 3 parallel consumers per group.
+      # clicks-dlq: 1 partition — dead letter queue for failed events.
+
+THINGS TO UNDERSTAND:
+
+1. WHY TWO PORTS (29092 and 9092)?
+   This is the most confusing part of Kafka Docker setups. Here's why:
+
+   - Your Fastify app (inside Docker) connects to kafka:29092
+     ("kafka" is resolved by Docker DNS to the container's IP)
+   - Your kcat tool (on your host machine) connects to localhost:9092
+     (port-mapped from the container)
+
+   Kafka ADVERTISES to clients which address to use for subsequent
+   connections. If you only had one listener, either containers or
+   your host machine wouldn't be able to connect properly.
+
+   This is called the "advertised listeners" problem and it confuses
+   EVERYONE when they first set up Kafka in Docker.
+
+2. WHY A SEPARATE kafka-init CONTAINER?
+   Kafka doesn't auto-create topics by default (you CAN enable it with
+   KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but that's dangerous in
+   production because typos create garbage topics).
+
+   Instead, we explicitly create topics in an init container.
+   This is the same pattern we used with the `migrate` container
+   for Drizzle schema pushes.
+
+3. WHY 3 PARTITIONS FOR clicks?
+   - We'll have 2 consumer groups (writer + aggregator)
+   - Each group can have up to 3 consumers for parallelism
+   - 3 is a good starting point. You can increase later but NOT decrease.
+   - PARTITION COUNT IS HARD TO CHANGE — plan it upfront.
+
+4. WHY 1 PARTITION FOR clicks-dlq?
+   Dead letter events don't need parallelism. They're rare (hopefully)
+   and you process them manually or with a repair script.
+
+Also add `kafkadata` to the volumes section at the bottom:
+
+    volumes:
+      pgdata:
+      redisdata:
+      prometheusdata:
+      grafanadata:
+      kafkadata:
+        # Kafka stores topic partitions as log segments on disk.
+        # This persists your events across container restarts.
+
+Now update your `app` service to depend on Kafka:
+
+    app:
+      # ... existing config ...
+      depends_on:
+        db:
+          condition: service_healthy
+        migrate:
+          condition: service_completed_successfully
+        redis:
+          condition: service_healthy
+        kafka:
+          condition: service_healthy
+      environment:
+        DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+        JWT_SECRET: docker-dev-secret-change-in-production
+        REDIS_URL: redis://redis:6379
+        KAFKA_BROKERS: kafka:29092
+        PORT: 3000
+        HOST: 0.0.0.0
+        NODE_ENV: production
+
+
+================================================================================
+STEP 2: START KAFKA AND VERIFY
+================================================================================
+
+Bring everything up:
+
+    docker compose up -d
+
+Watch Kafka start (it takes 15-30 seconds):
+
+    docker compose logs -f kafka
+
+You should see lines like:
+    [KafkaServer id=1] started (kafka.server.KafkaServer)
+
+Verify topics were created:
+
+    docker compose logs kafka-init
+
+You should see:
+    Creating Kafka topics...
+    Created topic clicks.
+    Created topic clicks-dlq.
+    Topics created:
+    clicks
+    clicks-dlq
+
+If kafka-init failed (connection refused), Kafka wasn't ready yet.
+Just run it again:
+
+    docker compose run --rm kafka-init
+
+
+================================================================================
+STEP 3: EXPLORE KAFKA WITH KCAT (THE KAFKA CLI TOOL)
+================================================================================
+
+kcat (formerly kafkacat) is to Kafka what redis-cli is to Redis.
+It lets you produce and consume messages from the command line.
+
+INSTALL KCAT:
+
+On Windows with Docker, the easiest way is to use the Confluent image:
+
+    docker run --rm --network tinyscale-network confluentinc/cp-kafka:7.6.0 bash
+
+This gives you a shell inside a container on the same Docker network.
+From there you can use kafka-console-producer and kafka-console-consumer
+(which are equivalent to kcat for our purposes).
+
+Alternatively, install kcat natively:
+- Windows: Download from https://github.com/edenhill/kcat/releases
+- Or use WSL: apt install kafkacat
+
+
+>> PRODUCE A TEST MESSAGE <<
+
+Using the Confluent tools from inside Docker:
+
+    docker compose exec kafka kafka-console-producer \
+      --bootstrap-server localhost:29092 \
+      --topic clicks
+
+Now type a message and press Enter:
+
+    {"urlId":"test-123","shortCode":"abc","ip":"1.2.3.4","clickedAt":"2026-04-14T10:00:00Z"}
+
+Press Ctrl+C to exit the producer.
+
+You just wrote an event to the "clicks" topic.
+
+
+>> CONSUME THE MESSAGE <<
+
+    docker compose exec kafka kafka-console-consumer \
+      --bootstrap-server localhost:29092 \
+      --topic clicks \
+      --from-beginning
+
+You should see your message appear. Press Ctrl+C to stop.
+
+--from-beginning means "start reading from offset 0" — i.e., replay
+all events. Without it, you'd only see NEW events.
+
+
+>> CHECK TOPIC DETAILS <<
+
+    docker compose exec kafka kafka-topics \
+      --bootstrap-server localhost:29092 \
+      --describe \
+      --topic clicks
+
+Output:
+    Topic: clicks   TopicId: xxxxx   PartitionCount: 3   ReplicationFactor: 1
+        Topic: clicks   Partition: 0   Leader: 1   Replicas: 1   Isr: 1
+        Topic: clicks   Partition: 1   Leader: 1   Replicas: 1   Isr: 1
+        Topic: clicks   Partition: 2   Leader: 1   Replicas: 1   Isr: 1
+
+This tells you:
+- 3 partitions (0, 1, 2)
+- Leader is broker 1 (our only broker)
+- Isr (In-Sync Replicas) is 1 — no replicas since replication-factor=1
+
+
+>> CHECK CONSUMER GROUP OFFSETS (after you have consumers running) <<
+
+    docker compose exec kafka kafka-consumer-groups \
+      --bootstrap-server localhost:29092 \
+      --describe \
+      --group click-writer
+
+This shows the LAG — how far behind each consumer is:
+
+    GROUP         TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+    click-writer  clicks  0          42              45              3
+    click-writer  clicks  1          38              38              0
+    click-writer  clicks  2          40              41              1
+
+LAG = LOG-END-OFFSET - CURRENT-OFFSET = events not yet processed.
+If LAG keeps growing, your consumer is too slow.
+
+THINGS TO UNDERSTAND:
+
+1. The CLI tools are ESSENTIAL for debugging Kafka. When your app
+   isn't receiving events, you need to check:
+   - Is the topic receiving events? (consume from beginning)
+   - Is the consumer group making progress? (describe group)
+   - Which partition has the most lag? (describe group)
+
+2. These are the same tools you'll use in production.
+   kafka-console-consumer + kafka-consumer-groups are your best friends.
+
+
+================================================================================
+DAY 3-5: IMPLEMENT KAFKA IN TINYSCALE
+================================================================================
+
+Now we replace BullMQ with Kafka. Here's the architecture change:
+
+BEFORE (BullMQ):
+
+    Redirect Handler → BullMQ Queue (Redis) → Click Worker → Postgres
+                       (one-to-one)
+
+AFTER (Kafka):
+
+    Redirect Handler → Kafka Producer → "clicks" topic
+                                            │
+                      ┌─────────────────────┼─────────────────────┐
+                      │                     │                     │
+                      ▼                     ▼                     ▼
+               Consumer Group:       Consumer Group:        (Future)
+               "click-writer"        "click-aggregator"     "analytics-export"
+                      │                     │
+                      ▼                     ▼
+                  Postgres              Postgres
+                  (clicks table)        (click_hourly_stats table)
+
+Same event, multiple consumers, each doing different work.
+Adding a new consumer (like analytics-export) doesn't require
+changing ANY existing code. That's the power of event-driven architecture.
+
+
+================================================================================
+STEP 4: INSTALL KAFKAJS
+================================================================================
+
+    npm install kafkajs
+
+kafkajs is the standard Kafka client for Node.js. It's:
+- Pure JavaScript (no native dependencies, unlike node-rdkafka)
+- Well-maintained and battle-tested
+- Good TypeScript support
+
+COMPARISON:
+    BullMQ needed: npm install bullmq (which uses ioredis internally)
+    KafkaJS needs: npm install kafkajs (standalone, no Redis needed)
+
+
+================================================================================
+STEP 5: ADD KAFKA CONFIG TO YOUR ENV
+================================================================================
+
+Open src/config/env.ts and add the KAFKA_BROKERS variable.
+
+Add this to your env schema (next to the existing variables):
+
+    KAFKA_BROKERS: z.string().default("localhost:9092"),
+    // Comma-separated list of Kafka broker addresses.
+    // In Docker: "kafka:29092"
+    // On host: "localhost:9092"
+    // In production: "broker1:9092,broker2:9092,broker3:9092"
+
+THINGS TO UNDERSTAND:
+
+1. We use a comma-separated string, not an array, because environment
+   variables are always strings. We'll split it in the Kafka client config.
+
+2. "Brokers" is plural because in production you'd have multiple.
+   The client uses any broker as an initial connection point, then
+   discovers the full cluster. You don't need to list ALL brokers —
+   just enough for initial discovery.
+
+
+================================================================================
+STEP 6: CREATE THE KAFKA PRODUCER PLUGIN
+================================================================================
+
+Create a new file: src/plugins/kafka.plugin.ts
+
+    import fp from "fastify-plugin";
+    import { type FastifyInstance } from "fastify";
+    import { Kafka, type Producer, logLevel } from "kafkajs";
+    import { env } from "../config/env.js";
+
+    // Extend Fastify's type system so we can access kafka producer via request.server
+    declare module "fastify" {
+      interface FastifyInstance {
+        kafkaProducer: Producer;
+      }
+    }
+
+    export const kafkaPlugin = fp(async (fastify: FastifyInstance) => {
+      // Create the Kafka client
+      const kafka = new Kafka({
+        clientId: "tinyscale-api",
+        // clientId identifies this application to the Kafka cluster.
+        // Shows up in Kafka logs and metrics. Use your app name.
+
+        brokers: env.KAFKA_BROKERS.split(","),
+        // Split the comma-separated string into an array.
+        // e.g., "kafka:29092" → ["kafka:29092"]
+        // e.g., "broker1:9092,broker2:9092" → ["broker1:9092", "broker2:9092"]
+
+        logLevel: logLevel.WARN,
+        // KafkaJS is VERY chatty at INFO level.
+        // WARN is enough for development. Use ERROR in production.
+
+        retry: {
+          initialRetryTime: 300,
+          retries: 10,
+          // If the initial connection fails, retry 10 times with exponential backoff.
+          // Kafka takes 15-30 seconds to start — our app might be ready first.
+        },
+      });
+
+      // Create a producer instance
+      const producer = kafka.producer({
+        allowAutoTopicCreation: false,
+        // NEVER auto-create topics in production. Typos create garbage topics.
+        // We create topics explicitly in the kafka-init container.
+
+        transactionTimeout: 30000,
+        // 30 second timeout for transactional sends (we won't use transactions,
+        // but it's good to have a sane default).
+      });
+
+      // Connect the producer
+      try {
+        await producer.connect();
+        fastify.log.info("Kafka producer connected");
+      } catch (err) {
+        // DON'T crash the app if Kafka is down.
+        // The redirect handler will gracefully degrade (log, don't crash).
+        fastify.log.error(err, "Kafka producer failed to connect — events will be lost until reconnection");
+      }
+
+      // Decorate Fastify so route handlers can access the producer
+      fastify.decorate("kafkaProducer", producer);
+
+      // Clean up on shutdown
+      fastify.addHook("onClose", async () => {
+        fastify.log.info("Disconnecting Kafka producer");
+        await producer.disconnect();
+      });
+    });
+
+THINGS TO UNDERSTAND:
+
+1. COMPARE THIS TO YOUR BULLMQ QUEUE PLUGIN (src/plugins/queue.plugin.ts):
+
+        // BullMQ (before)
+        const clickQueue = createClickQueue();
+        fastify.decorate("clickQueue", clickQueue);
+
+        // Kafka (after)
+        const producer = kafka.producer();
+        await producer.connect();
+        fastify.decorate("kafkaProducer", producer);
+
+    Almost the same pattern. The difference:
+    - BullMQ queue is lazy — it connects to Redis when you first add a job.
+    - Kafka producer needs an explicit connect() call.
+
+2. WHY allowAutoTopicCreation: false?
+   Imagine you typo "cliks" instead of "clicks" in your producer.
+   With auto-creation ON: Kafka creates a "cliks" topic, your events go
+   there, nobody consumes them, you don't notice for days.
+   With auto-creation OFF: You get an error immediately. Much safer.
+
+3. WHY WE CATCH THE CONNECTION ERROR:
+   In Week 3, we said "if Redis dies, your app should still work — just slower."
+   Same principle with Kafka. If Kafka is down, redirects should still work.
+   Click events will be lost (we'll handle this with graceful degradation later),
+   but the user gets their redirect.
+
+
+================================================================================
+STEP 7: MODIFY THE REDIRECT HANDLER TO PRODUCE TO KAFKA
+================================================================================
+
+Open src/modules/url/url.handler.ts and replace the BullMQ queue.add()
+call with a Kafka producer.send() call.
+
+BEFORE (BullMQ):
+
+    // Push click to BullMQ queue — worker will batch-insert to Postgres later
+    request.server.clickQueue
+      .add("click", {
+        urlId: url.id,
+        shortCode: url.shortCode,
+        referrer: request.headers.referer ?? (request.headers.referrer as string | undefined) ?? null,
+        userAgent: request.headers["user-agent"] ?? null,
+        ip: request.ip ?? null,
+        clickedAt: new Date().toISOString(),
+      })
+      .catch((err) => request.log.error(err, "Failed to enqueue click"));
+
+AFTER (Kafka):
+
+    import { type FastifyRequest, type FastifyReply } from "fastify";
+    import { createShortUrl, resolveShortCode } from "./url.service.js";
+    import type { ShortenBody, RedirectParams } from "./url.schema.js";
+    import { env } from "../../config/env.js";
+    import { redirectsTotal } from "../../plugins/metrics.plugin.js";
+
+    // Define the click event shape (same fields as your old ClickJobData)
+    export interface ClickEvent {
+      urlId: string;
+      shortCode: string;
+      referrer: string | null;
+      userAgent: string | null;
+      ip: string | null;
+      clickedAt: string; // ISO timestamp
+    }
+
+    export async function shortenHandler(
+      request: FastifyRequest<{ Body: ShortenBody }>,
+      reply: FastifyReply
+    ) {
+      const url = await createShortUrl(
+        request.server,
+        request.user.userId,
+        request.body.url,
+        request.body.expiresAt
+      );
+
+      const shortUrl = `http://${env.HOST === "0.0.0.0" ? "localhost" : env.HOST}:${env.PORT}/${url.shortCode}`;
+
+      return reply.status(201).send({
+        id: url.id,
+        shortCode: url.shortCode,
+        shortUrl,
+        originalUrl: url.originalUrl,
+        expiresAt: url.expiresAt?.toISOString() ?? null,
+        createdAt: url.createdAt.toISOString(),
+      });
+    }
+
+    export async function redirectHandler(
+      request: FastifyRequest<{ Params: RedirectParams }>,
+      reply: FastifyReply
+    ) {
+      const url = await resolveShortCode(request.server, request.params.code);
+
+      // Build the click event
+      const clickEvent: ClickEvent = {
+        urlId: url.id,
+        shortCode: url.shortCode,
+        referrer: request.headers.referer ?? (request.headers.referrer as string | undefined) ?? null,
+        userAgent: request.headers["user-agent"] ?? null,
+        ip: request.ip ?? null,
+        clickedAt: new Date().toISOString(),
+      };
+
+      // Produce to Kafka — fire and forget (don't await, don't block redirect)
+      request.server.kafkaProducer
+        .send({
+          topic: "clicks",
+          messages: [
+            {
+              // KEY: urlId — ensures all clicks for the same URL go to the
+              // same partition, which preserves ordering per-URL and makes
+              // aggregation in Consumer 2 easier.
+              key: clickEvent.urlId,
+              // VALUE: the full event as JSON
+              value: JSON.stringify(clickEvent),
+              // HEADERS: metadata about the event (optional but useful)
+              headers: {
+                "event-type": "click",
+                "produced-at": new Date().toISOString(),
+              },
+            },
+          ],
+        })
+        .catch((err) => {
+          request.log.error(err, "Failed to produce click event to Kafka");
+          // Event is LOST. This is the tradeoff for not blocking the redirect.
+          // We'll add graceful degradation in Day 6-7.
+        });
+
+      // Track redirect metric (Prometheus)
+      redirectsTotal.inc();
+
+      // Redirect immediately — don't wait for Kafka
+      return reply.redirect(url.originalUrl);
+    }
+
+THINGS TO UNDERSTAND:
+
+1. THE KEY DIFFERENCE IN API:
+
+        // BullMQ
+        queue.add("click", data)
+
+        // Kafka
+        producer.send({
+          topic: "clicks",
+          messages: [{ key: urlId, value: JSON.stringify(data) }]
+        })
+
+    Kafka requires you to serialize data to a string/Buffer yourself.
+    BullMQ does JSON.stringify internally. Same thing, just explicit in Kafka.
+
+2. WHY key: clickEvent.urlId?
+    Without a key, Kafka round-robins messages across partitions.
+    With a key, Kafka hashes the key and ALWAYS sends it to the same partition.
+
+    hash("url-123") % 3 = partition 1  (always)
+    hash("url-456") % 3 = partition 0  (always)
+    hash("url-789") % 3 = partition 2  (always)
+
+    This means all clicks for "url-123" are in partition 1, in order.
+    Consumer 2 (hourly aggregator) counts clicks per URL.
+    If clicks for the same URL are spread across partitions,
+    the aggregator would need to coordinate across partitions — much harder.
+
+3. WHY messages IS AN ARRAY?
+    You can send multiple messages in a single call (batching).
+    For a redirect handler, we have one event at a time.
+    But in bulk import scenarios, you'd batch thousands.
+
+4. WHY HEADERS?
+    Headers are metadata that consumers can read without deserializing
+    the value. Useful for:
+    - Routing (event-type header)
+    - Tracing (correlation-id header)
+    - Debugging (produced-at timestamp)
+
+5. WHY .catch() AND NOT await?
+    Same reason as with BullMQ: we don't want the redirect to wait for
+    Kafka. Fire the event and redirect immediately. If Kafka is slow or
+    down, the user still gets their redirect.
+
+
+================================================================================
+STEP 8: REGISTER THE KAFKA PLUGIN
+================================================================================
+
+Open src/app.ts and register the Kafka plugin.
+
+Add the import:
+
+    import { kafkaPlugin } from "./plugins/kafka.plugin.js";
+
+Add the registration (after the existing plugins):
+
+    await app.register(kafkaPlugin);
+
+And REMOVE the old BullMQ queue plugin registration:
+
+    // REMOVE THIS LINE:
+    // await app.register(queuePlugin);
+
+You can also remove the import of queuePlugin if you had one.
+
+NOTE: Don't delete the BullMQ files yet (click-queue.ts, click-worker.ts,
+queue.plugin.ts). Keep them around for reference. You can delete them
+after Kafka is working end-to-end.
+
+
+================================================================================
+STEP 9: BUILD CONSUMER 1 — CLICK WRITER (POSTGRES)
+================================================================================
+
+This consumer does what your old BullMQ click-worker.ts did:
+reads click events and batch-inserts them to Postgres.
+
+Create a new file: src/consumers/click-writer.consumer.ts
+
+    import { Kafka, logLevel, type EachBatchPayload } from "kafkajs";
+    import { drizzle } from "drizzle-orm/node-postgres";
+    import pg from "pg";
+    import { clicks } from "../db/schema/index.js";
+    import { Redis } from "ioredis";
+    import { env } from "../config/env.js";
+    import { produceToDeadLetter } from "./dead-letter.producer.js";
+
+    // ── Config ──────────────────────────────────────────────
+    const CONSUMER_GROUP = "click-writer";
+    const TOPIC = "clicks";
+
+    // ── Connections (separate from the API's connections) ───
+    let pool: pg.Pool | null = null;
+    let db: ReturnType<typeof drizzle> | null = null;
+    let redis: Redis | null = null;
+
+    function getDb() {
+      if (!db) {
+        pool = new pg.Pool({
+          connectionString: env.DATABASE_URL,
+          max: 5,
+        });
+        db = drizzle(pool);
+      }
+      return db;
+    }
+
+    function getRedis() {
+      if (!redis) {
+        redis = new Redis(env.REDIS_URL);
+      }
+      return redis;
+    }
+
+    // ── The Consumer ────────────────────────────────────────
+    export async function startClickWriterConsumer(): Promise<void> {
+      const kafka = new Kafka({
+        clientId: "tinyscale-click-writer",
+        brokers: env.KAFKA_BROKERS.split(","),
+        logLevel: logLevel.WARN,
+        retry: {
+          initialRetryTime: 300,
+          retries: 10,
+        },
+      });
+
+      const consumer = kafka.consumer({
+        groupId: CONSUMER_GROUP,
+        // groupId = consumer group name. All consumers with the same groupId
+        // share partitions. Each partition goes to exactly one consumer in the group.
+
+        sessionTimeout: 30000,
+        // If the broker doesn't hear from this consumer for 30 seconds,
+        // it considers it dead and rebalances partitions to other consumers.
+
+        heartbeatInterval: 3000,
+        // Send a heartbeat every 3 seconds to tell the broker "I'm alive."
+        // Must be less than sessionTimeout (usually 1/3 of it).
+      });
+
+      await consumer.connect();
+      console.log(`[ClickWriter] Consumer connected (group: ${CONSUMER_GROUP})`);
+
+      // Subscribe to the clicks topic
+      await consumer.subscribe({
+        topic: TOPIC,
+        fromBeginning: false,
+        // fromBeginning: false = start from the latest offset (new events only).
+        // If this is a BRAND NEW consumer group, it starts from the end.
+        // If this consumer group has committed offsets before, it resumes
+        // from the last committed offset regardless of this setting.
+        //
+        // Set to true if you want to reprocess ALL historical events
+        // (e.g., when you first switch from BullMQ to Kafka and need
+        // to replay events you produced during testing).
+      });
+
+      // ── Process events in batches ─────────────────────────
+      // KafkaJS supports two modes:
+      //   eachMessage: processes one message at a time
+      //   eachBatch: processes a batch of messages at once
+      //
+      // We use eachBatch because we want to do batch INSERTs to Postgres,
+      // just like our BullMQ worker did.
+
+      await consumer.run({
+        eachBatchAutoResolve: false,
+        // When false, WE control when offsets are committed.
+        // This is critical for at-least-once delivery:
+        //   1. Read a batch of events
+        //   2. Write them to Postgres
+        //   3. THEN commit the offset
+        // If we crash between 1 and 3, we'll re-read and re-process
+        // the batch on restart. That's at-least-once delivery.
+        //
+        // With eachBatchAutoResolve: true, KafkaJS commits offsets
+        // as each message is processed — before we've batched them
+        // into Postgres. That's at-most-once delivery (events can be lost).
+
+        eachBatch: async ({
+          batch,
+          resolveOffset,
+          heartbeat,
+          commitOffsetsIfNecessary,
+          isRunning,
+          isStale,
+        }: EachBatchPayload) => {
+          const { topic, partition, messages } = batch;
+
+          console.log(
+            `[ClickWriter] Received batch: ${messages.length} events from ${topic}[${partition}]`
+          );
+
+          // Parse all messages in the batch
+          const clickEvents: Array<{
+            urlId: string;
+            shortCode: string;
+            referrer: string | null;
+            userAgent: string | null;
+            ip: string | null;
+            clickedAt: string;
+            offset: string;
+          }> = [];
+
+          for (const message of messages) {
+            // Check if consumer is still running (it might be shutting down)
+            if (!isRunning() || isStale()) break;
+
+            if (!message.value) {
+              console.warn(
+                `[ClickWriter] Skipping null message at ${topic}[${partition}] offset ${message.offset}`
+              );
+              resolveOffset(message.offset);
+              continue;
+            }
+
+            try {
+              const event = JSON.parse(message.value.toString());
+              clickEvents.push({
+                urlId: event.urlId,
+                shortCode: event.shortCode,
+                referrer: event.referrer ?? null,
+                userAgent: event.userAgent ?? null,
+                ip: event.ip ?? null,
+                clickedAt: event.clickedAt,
+                offset: message.offset,
+              });
+            } catch (parseErr) {
+              console.error(
+                `[ClickWriter] Failed to parse message at ${topic}[${partition}] offset ${message.offset}:`,
+                parseErr
+              );
+
+              // Send unparseable message to dead letter topic
+              await produceToDeadLetter({
+                originalTopic: topic,
+                originalPartition: partition,
+                originalOffset: message.offset,
+                error: parseErr instanceof Error ? parseErr.message : String(parseErr),
+                rawValue: message.value?.toString() ?? "null",
+              });
+
+              // Mark this offset as resolved so we don't re-process it forever
+              resolveOffset(message.offset);
+            }
+          }
+
+          if (clickEvents.length === 0) {
+            await commitOffsetsIfNecessary();
+            return;
+          }
+
+          // Batch INSERT to Postgres
+          const database = getDb();
+          try {
+            await database.insert(clicks).values(
+              clickEvents.map((event) => ({
+                urlId: event.urlId,
+                referrer: event.referrer,
+                userAgent: event.userAgent,
+                ip: event.ip,
+                clickedAt: new Date(event.clickedAt),
+              }))
+            );
+
+            console.log(
+              `[ClickWriter] Inserted ${clickEvents.length} clicks to Postgres from ${topic}[${partition}]`
+            );
+
+            // Update Redis leaderboard (same as BullMQ worker did)
+            const r = getRedis();
+            const shortCodeCounts = new Map<string, number>();
+            for (const event of clickEvents) {
+              shortCodeCounts.set(
+                event.shortCode,
+                (shortCodeCounts.get(event.shortCode) ?? 0) + 1
+              );
+            }
+            for (const [code, count] of shortCodeCounts) {
+              await r.zincrby("clicks:leaderboard", count, code);
+              await r.del(`cache:stats:${code}`);
+            }
+
+            // Mark all offsets as resolved (we successfully processed them)
+            for (const event of clickEvents) {
+              resolveOffset(event.offset);
+            }
+
+            // Commit offsets NOW — this is the "checkpoint" that says
+            // "I've processed everything up to this offset."
+            await commitOffsetsIfNecessary();
+
+            // Send heartbeat to keep the broker happy during long batches
+            await heartbeat();
+          } catch (dbErr) {
+            console.error(
+              `[ClickWriter] Failed to insert batch to Postgres:`,
+              dbErr
+            );
+
+            // DON'T resolve offsets. DON'T commit.
+            // When this consumer restarts (or the next poll cycle),
+            // it will re-read these events from the last committed offset.
+            // This is AT-LEAST-ONCE delivery in action.
+            //
+            // But we need to be careful: if the error is permanent
+            // (e.g., invalid UUID), we'll retry forever.
+            // In production, you'd add retry counting and send to DLQ
+            // after N retries.
+
+            throw dbErr;
+            // Throwing in eachBatch causes KafkaJS to retry the batch.
+          }
+        },
+      });
+
+      // ── Graceful shutdown ─────────────────────────────────
+      const shutdown = async () => {
+        console.log("[ClickWriter] Shutting down...");
+        await consumer.disconnect();
+        if (pool) await pool.end();
+        if (redis) await redis.quit();
+        console.log("[ClickWriter] Shutdown complete");
+        process.exit(0);
+      };
+
+      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", shutdown);
+
+      console.log("[ClickWriter] Consumer running, waiting for events...");
+    }
+
+THINGS TO UNDERSTAND:
+
+1. COMPARE THIS TO YOUR BULLMQ CLICK WORKER (src/jobs/click-worker.ts):
+
+    BULLMQ WORKER:
+    - Creates a Worker with a handler function
+    - Handler receives ONE job at a time
+    - We manually buffer and batch (clickBuffer, BATCH_SIZE, flushTimer)
+    - BullMQ handles retries and stalled jobs
+
+    KAFKA CONSUMER:
+    - Subscribes to a topic with eachBatch
+    - Handler receives a BATCH of messages at once (Kafka does the batching!)
+    - We INSERT the whole batch at once
+    - WE handle offset commits (manual control over "processed" state)
+    - Retries happen automatically by NOT committing offsets
+
+    The manual batching logic (clickBuffer, scheduleFlush, scheduleRetry)
+    that was the hardest part of click-worker.ts is now GONE. Kafka
+    gives you batches natively. Your consumer is simpler.
+
+2. eachBatchAutoResolve: false IS CRITICAL:
+
+    With autoResolve: true (default):
+        Read message → KafkaJS marks it "resolved" → you process it → maybe crash
+        If crash: message is already marked resolved → DATA LOST
+
+    With autoResolve: false:
+        Read message → you process it → YOU call resolveOffset() → then commit
+        If crash before resolveOffset: message is NOT resolved → re-delivered
+
+    This is the difference between AT-MOST-ONCE and AT-LEAST-ONCE delivery.
+    For click tracking, losing events is worse than processing duplicates.
+    Always use autoResolve: false for important data.
+
+3. WHY commitOffsetsIfNecessary() AND NOT commitOffsets()?
+    commitOffsetsIfNecessary() only commits if enough time has passed
+    since the last commit (controlled by autoCommitInterval, default 5s).
+    This avoids hammering Kafka with offset commits on every batch.
+
+    You CAN use commitOffsets() to force an immediate commit, but it's
+    usually unnecessary and slower.
+
+4. WHY heartbeat()?
+    While processing a large batch, the consumer needs to tell Kafka
+    "I'm still alive." If processing takes longer than sessionTimeout
+    (30 seconds), Kafka assumes the consumer is dead and rebalances.
+    Calling heartbeat() resets the timer.
+
+5. THIS IS A SEPARATE PROCESS:
+    Notice we import env, create our own Postgres pool, create our own
+    Redis connection. This consumer runs INDEPENDENTLY of the Fastify app.
+    In Docker, it'll be a separate container (or a separate process
+    in the same container). We'll set this up shortly.
+
+
+================================================================================
+STEP 10: BUILD CONSUMER 2 — HOURLY AGGREGATOR
+================================================================================
+
+This is the NEW consumer that didn't exist with BullMQ.
+It counts clicks per URL per hour and stores the results in a summary table.
+
+WHY A SUMMARY TABLE?
+    Currently, to answer "how many clicks did url-abc get in the last hour?"
+    you'd run:
+        SELECT COUNT(*) FROM clicks
+        WHERE url_id = 'abc' AND clicked_at >= NOW() - INTERVAL '1 hour'
+
+    This scans potentially millions of rows. As your clicks table grows,
+    this query gets slower and slower.
+
+    With a summary table:
+        SELECT click_count FROM click_hourly_stats
+        WHERE url_id = 'abc' AND hour_bucket = '2026-04-14T10:00:00Z'
+
+    One row lookup. Instant. O(1) instead of O(n).
+
+    This is called PRE-AGGREGATION — compute the answer ahead of time
+    so the query is fast.
+
+
+>> FIRST: CREATE THE DATABASE MIGRATION <<
+
+Add the click_hourly_stats table to src/db/schema/tables.ts:
+
+    import {
+      pgTable,
+      uuid,
+      varchar,
+      timestamp,
+      index,
+      integer,
+      uniqueIndex,
+    } from "drizzle-orm/pg-core";
+
+    // ... existing tables (users, urls, clicks) ...
+
+    // ── Click Hourly Stats (pre-aggregated click counts) ────
+    export const clickHourlyStats = pgTable(
+      "click_hourly_stats",
+      {
+        id: uuid("id").defaultRandom().primaryKey(),
+        urlId: uuid("url_id")
+          .notNull()
+          .references(() => urls.id, { onDelete: "cascade" }),
+        hourBucket: timestamp("hour_bucket", { withTimezone: true }).notNull(),
+        // hour_bucket = the START of the hour, e.g., 2026-04-14T10:00:00Z
+        // All clicks between 10:00:00 and 10:59:59 go into this bucket.
+        clickCount: integer("click_count").notNull().default(0),
+        // Running count of clicks in this hour for this URL.
+        lastUpdatedAt: timestamp("last_updated_at", { withTimezone: true })
+          .defaultNow()
+          .notNull(),
+        // When this row was last incremented. Useful for debugging.
+      },
+      (table) => [
+        uniqueIndex("idx_click_hourly_stats_url_hour").on(
+          table.urlId,
+          table.hourBucket
+        ),
+        // UNIQUE index on (url_id, hour_bucket) — one row per URL per hour.
+        // This also enables upsert: INSERT ... ON CONFLICT (url_id, hour_bucket)
+        // DO UPDATE SET click_count = click_count + 1
+        index("idx_click_hourly_stats_hour").on(table.hourBucket),
+        // Index on hour_bucket for time-range queries
+        // (e.g., "get all stats for the last 24 hours")
+      ]
+    );
+
+THINGS TO UNDERSTAND:
+
+1. WHY hour_bucket AND NOT just a date?
+    hour_bucket = 2026-04-14T10:00:00Z means "the hour from 10:00 to 10:59."
+    This is called TIME BUCKETING. It's how all analytics systems work:
+    - Prometheus stores metrics in time buckets
+    - ClickHouse uses partition keys based on time
+    - Grafana queries expect time-bucketed data
+
+2. WHY A UNIQUE INDEX ON (url_id, hour_bucket)?
+    Because we'll UPSERT: if the row exists, increment click_count.
+    If it doesn't exist, create it with click_count = 1.
+    The unique index enables ON CONFLICT DO UPDATE.
+
+3. WHY integer FOR click_count?
+    Integer is fine for hourly counts. Even at 1 million clicks/hour
+    for a single URL, integer (max ~2.1 billion) is plenty.
+    For daily or total counts, you might want bigint.
+
+Now push the schema to the database:
+
+    npx drizzle-kit push
+
+Or if you're using Docker:
+
+    docker compose run --rm migrate
+
+
+>> NOW: BUILD THE AGGREGATOR CONSUMER <<
+
+Create a new file: src/consumers/click-aggregator.consumer.ts
+
+    import { Kafka, logLevel, type EachBatchPayload } from "kafkajs";
+    import { drizzle } from "drizzle-orm/node-postgres";
+    import { sql } from "drizzle-orm";
+    import pg from "pg";
+    import { clickHourlyStats } from "../db/schema/index.js";
+    import { env } from "../config/env.js";
+    import { produceToDeadLetter } from "./dead-letter.producer.js";
+
+    // ── Config ──────────────────────────────────────────────
+    const CONSUMER_GROUP = "click-aggregator";
+    const TOPIC = "clicks";
+
+    // ── Connections ─────────────────────────────────────────
+    let pool: pg.Pool | null = null;
+    let db: ReturnType<typeof drizzle> | null = null;
+
+    function getDb() {
+      if (!db) {
+        pool = new pg.Pool({
+          connectionString: env.DATABASE_URL,
+          max: 3,
+          // Aggregator needs fewer connections than the writer
+        });
+        db = drizzle(pool);
+      }
+      return db;
+    }
+
+    /**
+     * Truncate a timestamp to the start of its hour.
+     * "2026-04-14T10:37:22Z" → "2026-04-14T10:00:00.000Z"
+     */
+    function truncateToHour(isoTimestamp: string): Date {
+      const date = new Date(isoTimestamp);
+      date.setMinutes(0, 0, 0);
+      // Sets minutes, seconds, milliseconds to 0
+      // 10:37:22.456 → 10:00:00.000
+      return date;
+    }
+
+    // ── The Consumer ────────────────────────────────────────
+    export async function startClickAggregatorConsumer(): Promise<void> {
+      const kafka = new Kafka({
+        clientId: "tinyscale-click-aggregator",
+        brokers: env.KAFKA_BROKERS.split(","),
+        logLevel: logLevel.WARN,
+        retry: {
+          initialRetryTime: 300,
+          retries: 10,
+        },
+      });
+
+      const consumer = kafka.consumer({
+        groupId: CONSUMER_GROUP,
+        // Different groupId than "click-writer"!
+        // This is a SEPARATE consumer group.
+        // Both groups independently consume ALL events from the "clicks" topic.
+        sessionTimeout: 30000,
+        heartbeatInterval: 3000,
+      });
+
+      await consumer.connect();
+      console.log(`[ClickAggregator] Consumer connected (group: ${CONSUMER_GROUP})`);
+
+      await consumer.subscribe({
+        topic: TOPIC,
+        fromBeginning: false,
+      });
+
+      await consumer.run({
+        eachBatchAutoResolve: false,
+
+        eachBatch: async ({
+          batch,
+          resolveOffset,
+          heartbeat,
+          commitOffsetsIfNecessary,
+          isRunning,
+          isStale,
+        }: EachBatchPayload) => {
+          const { topic, partition, messages } = batch;
+
+          console.log(
+            `[ClickAggregator] Received batch: ${messages.length} events from ${topic}[${partition}]`
+          );
+
+          // ── Step 1: Parse events and aggregate in memory ──
+          // Group by (urlId, hourBucket) → count
+          const aggregation = new Map<string, { urlId: string; hourBucket: Date; count: number }>();
+          let lastOffset = "";
+
+          for (const message of messages) {
+            if (!isRunning() || isStale()) break;
+
+            if (!message.value) {
+              resolveOffset(message.offset);
+              continue;
+            }
+
+            try {
+              const event = JSON.parse(message.value.toString());
+              const hourBucket = truncateToHour(event.clickedAt);
+              const key = `${event.urlId}:${hourBucket.toISOString()}`;
+
+              const existing = aggregation.get(key);
+              if (existing) {
+                existing.count++;
+              } else {
+                aggregation.set(key, {
+                  urlId: event.urlId,
+                  hourBucket,
+                  count: 1,
+                });
+              }
+
+              lastOffset = message.offset;
+            } catch (parseErr) {
+              console.error(
+                `[ClickAggregator] Failed to parse message at ${topic}[${partition}] offset ${message.offset}:`,
+                parseErr
+              );
+
+              await produceToDeadLetter({
+                originalTopic: topic,
+                originalPartition: partition,
+                originalOffset: message.offset,
+                error: parseErr instanceof Error ? parseErr.message : String(parseErr),
+                rawValue: message.value?.toString() ?? "null",
+              });
+
+              resolveOffset(message.offset);
+            }
+          }
+
+          if (aggregation.size === 0) {
+            await commitOffsetsIfNecessary();
+            return;
+          }
+
+          // ── Step 2: UPSERT aggregated counts to Postgres ──
+          const database = getDb();
+
+          try {
+            // Process each aggregation entry with an UPSERT
+            for (const [, agg] of aggregation) {
+              await database
+                .insert(clickHourlyStats)
+                .values({
+                  urlId: agg.urlId,
+                  hourBucket: agg.hourBucket,
+                  clickCount: agg.count,
+                  lastUpdatedAt: new Date(),
+                })
+                .onConflictDoUpdate({
+                  target: [clickHourlyStats.urlId, clickHourlyStats.hourBucket],
+                  set: {
+                    clickCount: sql`${clickHourlyStats.clickCount} + ${agg.count}`,
+                    lastUpdatedAt: new Date(),
+                  },
+                });
+              // ON CONFLICT (url_id, hour_bucket) DO UPDATE
+              //   SET click_count = click_count + <batch_count>,
+              //       last_updated_at = NOW()
+              //
+              // If the row exists: increment the count.
+              // If the row doesn't exist: create it with count = batch_count.
+              //
+              // This is IDEMPOTENT-ISH: if we reprocess the same batch
+              // (consumer crash before offset commit), we'll double-count.
+              // True idempotency requires tracking processed offsets.
+              // For hourly stats, slight overcounting is acceptable.
+              // For billing/financial data, you'd need exactly-once semantics.
+            }
+
+            console.log(
+              `[ClickAggregator] Upserted ${aggregation.size} hourly buckets from ${messages.length} events`
+            );
+
+            // Mark all offsets as resolved
+            resolveOffset(lastOffset);
+            await commitOffsetsIfNecessary();
+            await heartbeat();
+          } catch (dbErr) {
+            console.error(
+              `[ClickAggregator] Failed to upsert hourly stats:`,
+              dbErr
+            );
+            throw dbErr;
+            // Don't commit offsets — batch will be reprocessed on retry.
+          }
+        },
+      });
+
+      // ── Graceful shutdown ─────────────────────────────────
+      const shutdown = async () => {
+        console.log("[ClickAggregator] Shutting down...");
+        await consumer.disconnect();
+        if (pool) await pool.end();
+        console.log("[ClickAggregator] Shutdown complete");
+        process.exit(0);
+      };
+
+      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", shutdown);
+
+      console.log("[ClickAggregator] Consumer running, waiting for events...");
+    }
+
+THINGS TO UNDERSTAND:
+
+1. TWO CONSUMER GROUPS, SAME TOPIC:
+    "click-writer" and "click-aggregator" both read from "clicks" topic.
+    Every event is delivered to BOTH groups independently.
+    This is the 1-to-many pattern that BullMQ couldn't do.
+
+    With BullMQ, you'd need:
+        queue.add("click", data);        // for the writer
+        queue2.add("click-agg", data);   // for the aggregator
+    Two queues, two .add() calls, tightly coupled.
+
+    With Kafka:
+        producer.send({ topic: "clicks", messages: [...] });
+    One topic, one .send() call. Add consumers without changing producers.
+
+2. THE AGGREGATION PATTERN:
+    We aggregate IN MEMORY before writing to Postgres.
+    If a batch has 100 events and 30 are for url-abc, we do ONE upsert
+    with clickCount + 30, not 30 separate upserts.
+
+    This is the same optimization principle as your BullMQ batch INSERT.
+    Fewer database round-trips = better performance.
+
+3. UPSERT WITH ON CONFLICT:
+    INSERT ... ON CONFLICT ... DO UPDATE is a Postgres feature.
+    Drizzle's .onConflictDoUpdate() generates this SQL.
+
+    First time:  INSERT INTO click_hourly_stats (url_id, hour_bucket, click_count) VALUES ('abc', '10:00', 5)
+    Second time: UPDATE click_hourly_stats SET click_count = click_count + 3 WHERE url_id = 'abc' AND hour_bucket = '10:00'
+
+    The unique index on (url_id, hour_bucket) is what makes this work.
+
+4. IDEMPOTENCY CAVEAT:
+    If the consumer crashes AFTER the upsert but BEFORE committing the
+    offset, the batch will be reprocessed. The counts will be incremented
+    again → double-counting.
+
+    For click analytics, this is acceptable. A few extra counts won't
+    matter. For financial transactions, you'd need to track processed
+    offsets in Postgres (in the same transaction as the upsert) to
+    achieve exactly-once semantics. That's a more advanced pattern.
+
+
+================================================================================
+STEP 11: CREATE CONSUMER ENTRY POINTS
+================================================================================
+
+Your consumers need to be runnable as standalone processes.
+
+Create src/consumers/run-click-writer.ts:
+
+    import { startClickWriterConsumer } from "./click-writer.consumer.js";
+
+    console.log("Starting Click Writer Consumer...");
+    startClickWriterConsumer().catch((err) => {
+      console.error("Click Writer Consumer failed:", err);
+      process.exit(1);
+    });
+
+Create src/consumers/run-click-aggregator.ts:
+
+    import { startClickAggregatorConsumer } from "./click-aggregator.consumer.js";
+
+    console.log("Starting Click Aggregator Consumer...");
+    startClickAggregatorConsumer().catch((err) => {
+      console.error("Click Aggregator Consumer failed:", err);
+      process.exit(1);
+    });
+
+THINGS TO UNDERSTAND:
+
+1. THESE ARE SEPARATE PROCESSES:
+    Your system now has 3 Node.js processes:
+    - The Fastify API server (src/server.ts)
+    - The Click Writer consumer (src/consumers/run-click-writer.ts)
+    - The Click Aggregator consumer (src/consumers/run-click-aggregator.ts)
+
+    Each runs independently. If the aggregator crashes, the API and
+    writer keep working. If the API crashes, consumers keep processing.
+    This is DECOUPLING through Kafka.
+
+2. IN DOCKER, EACH CONSUMER IS A SEPARATE CONTAINER:
+    We'll add them to docker-compose.yml next.
+
+
+================================================================================
+STEP 12: ADD CONSUMERS TO DOCKER-COMPOSE
+================================================================================
+
+Add these services to your docker-compose.yml:
+
+    # ---- KAFKA CLICK WRITER CONSUMER ----
+    click-writer:
+      build:
+        context: .
+        dockerfile: Dockerfile
+      command: ["node", "dist/consumers/run-click-writer.js"]
+      # Override the default CMD to run the consumer instead of the API server
+      environment:
+        DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+        REDIS_URL: redis://redis:6379
+        KAFKA_BROKERS: kafka:29092
+      depends_on:
+        db:
+          condition: service_healthy
+        kafka:
+          condition: service_healthy
+        kafka-init:
+          condition: service_completed_successfully
+        migrate:
+          condition: service_completed_successfully
+      networks:
+        - tinyscale-network
+      restart: unless-stopped
+
+    # ---- KAFKA CLICK AGGREGATOR CONSUMER ----
+    click-aggregator:
+      build:
+        context: .
+        dockerfile: Dockerfile
+      command: ["node", "dist/consumers/run-click-aggregator.js"]
+      environment:
+        DATABASE_URL: postgres://dev:dev@db:5432/tinyscale
+        KAFKA_BROKERS: kafka:29092
+      depends_on:
+        db:
+          condition: service_healthy
+        kafka:
+          condition: service_healthy
+        kafka-init:
+          condition: service_completed_successfully
+        migrate:
+          condition: service_completed_successfully
+      networks:
+        - tinyscale-network
+      restart: unless-stopped
+
+THINGS TO UNDERSTAND:
+
+1. SAME DOCKERFILE, DIFFERENT COMMAND:
+    Both consumers use the same Docker image as the API.
+    The only difference is the `command:` — which file to run.
+
+    This is a common pattern: one Docker image, multiple entry points.
+    The Dockerfile builds everything (API + consumers).
+    Each service specifies which entry point to start.
+
+2. click-writer NEEDS REDIS (for leaderboard updates).
+   click-aggregator DOES NOT (it only writes to Postgres).
+   Only include what each service actually uses.
+
+3. BOTH DEPEND ON kafka-init:
+    Consumers need the "clicks" topic to exist before subscribing.
+    kafka-init creates it. depends_on ensures ordering.
+
+
+================================================================================
+DAY 6-7: ERROR HANDLING IN DISTRIBUTED SYSTEMS
+================================================================================
+
+Your system now has more moving parts:
+    API → Kafka → Consumer 1 → Postgres
+                → Consumer 2 → Postgres
+
+What happens when things go wrong? This is where distributed systems
+get HARD. You must think about every failure mode.
+
+
+================================================================================
+STEP 13: DEAD LETTER TOPIC IMPLEMENTATION
+================================================================================
+
+>> WHAT IS A DEAD LETTER TOPIC? <<
+
+A dead letter topic (DLT) is where you send events that CANNOT be processed.
+
+Examples of unprocessable events:
+- Malformed JSON (can't parse)
+- Missing required field (urlId is null)
+- Invalid data (urlId references a deleted URL)
+- Permanent database error (constraint violation)
+
+These events will NEVER succeed no matter how many times you retry.
+If you don't send them to a DLT, they block the consumer forever
+(the consumer retries, fails, retries, fails...).
+
+COMPARISON TO WHAT YOU KNOW:
+    BullMQ: Jobs that fail all retries go to the "failed" state.
+            You had removeOnFail: { count: 5000 } to keep them for
+            investigation.
+    Kafka:  No built-in dead letter mechanism. You implement it yourself
+            by producing failed events to a separate topic (clicks-dlq).
+
+Create a new file: src/consumers/dead-letter.producer.ts
+
+    import { Kafka, logLevel, type Producer } from "kafkajs";
+    import { env } from "../config/env.js";
+
+    const DLQ_TOPIC = "clicks-dlq";
+
+    // Singleton producer for the dead letter topic
+    let dlqProducer: Producer | null = null;
+
+    async function getDlqProducer(): Promise<Producer> {
+      if (!dlqProducer) {
+        const kafka = new Kafka({
+          clientId: "tinyscale-dlq-producer",
+          brokers: env.KAFKA_BROKERS.split(","),
+          logLevel: logLevel.WARN,
+        });
+        dlqProducer = kafka.producer();
+        await dlqProducer.connect();
+      }
+      return dlqProducer;
+    }
+
+    export interface DeadLetterEvent {
+      originalTopic: string;
+      originalPartition: number;
+      originalOffset: string;
+      error: string;
+      rawValue: string;
+    }
+
+    /**
+     * Send a failed event to the dead letter topic.
+     * Includes the original event data + error details for investigation.
+     */
+    export async function produceToDeadLetter(event: DeadLetterEvent): Promise<void> {
+      try {
+        const producer = await getDlqProducer();
+        await producer.send({
+          topic: DLQ_TOPIC,
+          messages: [
+            {
+              key: `${event.originalTopic}-${event.originalPartition}-${event.originalOffset}`,
+              value: JSON.stringify({
+                ...event,
+                failedAt: new Date().toISOString(),
+                // Include the timestamp so you know when this event failed.
+                // Combined with originalTopic/partition/offset, you can trace
+                // exactly what happened.
+              }),
+              headers: {
+                "original-topic": event.originalTopic,
+                "error-message": event.error,
+                "failed-at": new Date().toISOString(),
+              },
+            },
+          ],
+        });
+
+        console.warn(
+          `[DLQ] Event sent to ${DLQ_TOPIC}: ${event.originalTopic}[${event.originalPartition}] ` +
+          `offset ${event.originalOffset} — ${event.error}`
+        );
+      } catch (dlqErr) {
+        // If even the DLQ fails, log and move on.
+        // At this point, the event is truly lost.
+        // In production, you'd also alert (PagerDuty, Slack, etc.).
+        console.error(
+          `[DLQ] CRITICAL: Failed to send event to dead letter topic:`,
+          dlqErr
+        );
+      }
+    }
+
+THINGS TO UNDERSTAND:
+
+1. THE DLQ PATTERN:
+    Normal flow:  clicks topic → consumer → Postgres
+    Error flow:   clicks topic → consumer → FAILS → clicks-dlq topic
+
+    The DLQ event includes:
+    - The original event data (rawValue)
+    - Which topic/partition/offset it came from
+    - What error occurred
+    - When it failed
+
+    This gives you everything you need to investigate and potentially
+    replay the event after fixing the bug.
+
+2. WHY A SEPARATE PRODUCER?
+    The consumer and the DLQ producer are different Kafka clients.
+    The consumer READS from "clicks". The DLQ producer WRITES to "clicks-dlq".
+    They don't interfere with each other.
+
+3. WHAT TO DO WITH DLQ EVENTS?
+    Check them periodically:
+
+        docker compose exec kafka kafka-console-consumer \
+          --bootstrap-server localhost:29092 \
+          --topic clicks-dlq \
+          --from-beginning
+
+    If you see events there, investigate:
+    - Parse errors? Fix your event schema.
+    - DB constraint violations? Fix your data.
+    - Replayable errors? Write a script to re-produce them to "clicks".
+
+
+================================================================================
+STEP 14: GRACEFUL DEGRADATION WHEN KAFKA IS DOWN
+================================================================================
+
+>> THE PRINCIPLE: YOUR REDIRECT MUST ALWAYS WORK <<
+
+If Kafka is down:
+- The user clicks a short URL
+- They MUST get redirected (this is the core business function)
+- Click events will be lost (acceptable tradeoff)
+
+If you await the Kafka produce and it times out, the user gets a 500 error.
+That's unacceptable. Redirects are more important than analytics.
+
+The current handler already does this with .catch(), but let's make it
+more robust with a health flag.
+
+Update src/plugins/kafka.plugin.ts to track connection health:
+
+    import fp from "fastify-plugin";
+    import { type FastifyInstance } from "fastify";
+    import { Kafka, type Producer, logLevel } from "kafkajs";
+    import { env } from "../config/env.js";
+
+    // Extend Fastify's type system
+    declare module "fastify" {
+      interface FastifyInstance {
+        kafkaProducer: Producer;
+        kafkaHealthy: boolean;
+      }
+    }
+
+    export const kafkaPlugin = fp(async (fastify: FastifyInstance) => {
+      const kafka = new Kafka({
+        clientId: "tinyscale-api",
+        brokers: env.KAFKA_BROKERS.split(","),
+        logLevel: logLevel.WARN,
+        retry: {
+          initialRetryTime: 300,
+          retries: 10,
+        },
+      });
+
+      const producer = kafka.producer({
+        allowAutoTopicCreation: false,
+        transactionTimeout: 30000,
+      });
+
+      // Track connection health
+      let isHealthy = false;
+
+      producer.on("producer.connect", () => {
+        isHealthy = true;
+        fastify.log.info("Kafka producer connected");
+      });
+
+      producer.on("producer.disconnect", () => {
+        isHealthy = false;
+        fastify.log.warn("Kafka producer disconnected");
+      });
+
+      try {
+        await producer.connect();
+      } catch (err) {
+        fastify.log.error(err, "Kafka producer failed to connect — running in degraded mode");
+        // Don't crash. App works without Kafka, just loses events.
+      }
+
+      fastify.decorate("kafkaProducer", producer);
+      fastify.decorate("kafkaHealthy", {
+        getter() {
+          return isHealthy;
+        },
+      });
+      // Using a getter so kafkaHealthy always returns the current value
+      // of isHealthy, not a stale copy.
+
+      fastify.addHook("onClose", async () => {
+        fastify.log.info("Disconnecting Kafka producer");
+        await producer.disconnect();
+      });
+    });
+
+Now update the redirect handler to check health:
+
+    // In src/modules/url/url.handler.ts, update the Kafka produce section:
+
+    // Produce to Kafka — fire and forget (don't block redirect)
+    if (request.server.kafkaHealthy) {
+      request.server.kafkaProducer
+        .send({
+          topic: "clicks",
+          messages: [
+            {
+              key: clickEvent.urlId,
+              value: JSON.stringify(clickEvent),
+              headers: {
+                "event-type": "click",
+                "produced-at": new Date().toISOString(),
+              },
+            },
+          ],
+        })
+        .catch((err) => {
+          request.log.error(err, "Failed to produce click event to Kafka");
+        });
+    } else {
+      // Kafka is down — log but don't attempt to produce
+      // This avoids queueing up send attempts that will all fail
+      request.log.warn(
+        { urlId: clickEvent.urlId, shortCode: clickEvent.shortCode },
+        "Kafka unhealthy — click event dropped"
+      );
+    }
+
+THINGS TO UNDERSTAND:
+
+1. COMPARE TO YOUR REDIS GRACEFUL DEGRADATION:
+    In Week 3, your cache service had try/catch:
+    - If Redis is down: skip cache, hit Postgres (slower but works)
+
+    Same pattern with Kafka:
+    - If Kafka is down: skip event production, redirect still works (events lost)
+
+    This is called GRACEFUL DEGRADATION — the system provides reduced
+    functionality instead of total failure.
+
+2. WHY CHECK kafkaHealthy INSTEAD OF JUST .catch()?
+    If Kafka is down, producer.send() will queue the message internally
+    and retry. These retries consume memory and CPU. If Kafka is down
+    for minutes, you'll have thousands of queued sends.
+
+    By checking kafkaHealthy first, we skip the send entirely.
+    This is called FAST FAIL — don't try if you know it will fail.
+
+3. WHAT ABOUT THE LOST EVENTS?
+    Yes, clicks during Kafka downtime are lost. Is that acceptable?
+
+    For most analytics: YES. A few missing clicks don't matter.
+
+    If you absolutely can't lose events, you could:
+    - Write to a local file as backup (WAL pattern)
+    - Write to Redis as a temporary buffer (back to BullMQ, sort of)
+    - Use synchronous Postgres INSERT as fallback (slower)
+
+    Each option adds complexity. Choose based on your business requirements.
+    For a URL shortener's analytics, losing a few clicks is fine.
+
+4. THE PRODUCTION PATTERN:
+    In real production systems, you'd combine this with monitoring:
+    - Prometheus counter: kafka_events_dropped_total
+    - Alert if drops > 0 for more than 5 minutes
+    - On-call engineer investigates Kafka cluster
+
+    You could add a Prometheus counter here:
+
+        import { Counter } from "prom-client";
+
+        const kafkaEventsDropped = new Counter({
+          name: "tinyscale_kafka_events_dropped_total",
+          help: "Total click events dropped due to Kafka unavailability",
+        });
+
+        // In the else branch:
+        kafkaEventsDropped.inc();
+
+    Then alert on it in Grafana.
+
+
+================================================================================
+STEP 15: UPDATE YOUR IMPORTS AND REMOVE BULLMQ
+================================================================================
+
+Now that Kafka is in place, clean up the BullMQ references.
+
+1. REMOVE BullMQ from app.ts:
+   Delete the queuePlugin import and registration.
+
+2. REMOVE the clickQueue type extension from fastify.d.ts or
+   wherever you declared it. The kafkaProducer declaration in
+   kafka.plugin.ts replaces it.
+
+3. DON'T delete the old files yet:
+   Keep src/jobs/click-queue.ts, click-worker.ts, queue.plugin.ts,
+   and dead-letter.ts as reference. You can delete them after
+   everything works end-to-end with Kafka.
+
+4. UPDATE package.json scripts:
+   If you had a "worker" script that ran the BullMQ worker,
+   replace it with scripts for Kafka consumers:
+
+        "scripts": {
+          "dev": "tsx watch src/server.ts",
+          "build": "tsc",
+          "start": "node dist/server.js",
+          "consumer:click-writer": "node dist/consumers/run-click-writer.js",
+          "consumer:click-aggregator": "node dist/consumers/run-click-aggregator.js"
+        }
+
+5. You can uninstall BullMQ after everything is confirmed working:
+
+        npm uninstall bullmq
+
+
+================================================================================
+STEP 16: TESTING THE FULL PIPELINE
+================================================================================
+
+Bring everything up:
+
+    docker compose up -d --build
+
+Check all services are running:
+
+    docker compose ps
+
+You should see:
+    - app (running)
+    - kafka (healthy)
+    - kafka-init (exited 0)
+    - click-writer (running)
+    - click-aggregator (running)
+    - db (healthy)
+    - redis (healthy)
+    - nginx (running)
+    - prometheus (running)
+    - grafana (running)
+
+Check consumer logs:
+
+    docker compose logs -f click-writer click-aggregator
+
+You should see:
+    [ClickWriter] Consumer connected (group: click-writer)
+    [ClickWriter] Consumer running, waiting for events...
+    [ClickAggregator] Consumer connected (group: click-aggregator)
+    [ClickAggregator] Consumer running, waiting for events...
+
+
+>> TEST 1: PRODUCE A CLICK VIA THE API <<
+
+Create a short URL (if you don't have one):
+
+    curl -X POST http://localhost/api/urls \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer <your-jwt>" \
+      -d '{"url": "https://example.com"}'
+
+Click the short URL:
+
+    curl -v http://localhost/<short-code>
+
+Check the click-writer logs:
+
+    docker compose logs click-writer --tail 20
+
+You should see:
+    [ClickWriter] Received batch: 1 events from clicks[0]
+    [ClickWriter] Inserted 1 clicks to Postgres from clicks[0]
+
+Check the click-aggregator logs:
+
+    docker compose logs click-aggregator --tail 20
+
+You should see:
+    [ClickAggregator] Received batch: 1 events from clicks[0]
+    [ClickAggregator] Upserted 1 hourly buckets from 1 events
+
+
+>> TEST 2: CHECK THE DATA IN POSTGRES <<
+
+    docker compose exec db psql -U dev -d tinyscale
+
+    -- Check clicks table
+    SELECT * FROM clicks ORDER BY clicked_at DESC LIMIT 5;
+
+    -- Check hourly stats
+    SELECT * FROM click_hourly_stats ORDER BY last_updated_at DESC LIMIT 5;
+
+    -- Check aggregation is correct
+    SELECT
+      u.short_code,
+      s.hour_bucket,
+      s.click_count,
+      s.last_updated_at
+    FROM click_hourly_stats s
+    JOIN urls u ON s.url_id = u.id
+    ORDER BY s.hour_bucket DESC;
+
+You should see one row in click_hourly_stats with click_count = 1.
+Click the short URL a few more times and verify click_count increments.
+
+
+>> TEST 3: CHECK CONSUMER GROUP OFFSETS <<
+
+    docker compose exec kafka kafka-consumer-groups \
+      --bootstrap-server localhost:29092 \
+      --describe \
+      --group click-writer
+
+    docker compose exec kafka kafka-consumer-groups \
+      --bootstrap-server localhost:29092 \
+      --describe \
+      --group click-aggregator
+
+Both should show LAG = 0 (fully caught up).
+
+
+>> TEST 4: PRODUCE EVENTS DIRECTLY WITH CLI (BYPASS THE API) <<
+
+    docker compose exec kafka kafka-console-producer \
+      --bootstrap-server localhost:29092 \
+      --topic clicks
+
+Type this (use a real url_id from your database):
+
+    {"urlId":"<a-real-uuid>","shortCode":"test","referrer":null,"userAgent":"kcat-test","ip":"127.0.0.1","clickedAt":"2026-04-14T15:30:00Z"}
+
+Both consumers should pick it up. Check their logs.
+
+
+>> TEST 5: SIMULATE KAFKA DOWNTIME <<
+
+Stop Kafka:
+
+    docker compose stop kafka
+
+Click a short URL:
+
+    curl -v http://localhost/<short-code>
+
+You should STILL get the redirect (302). Check the API logs:
+
+    docker compose logs app --tail 10
+
+You should see a warning about Kafka being unhealthy and the event
+being dropped.
+
+Start Kafka again:
+
+    docker compose start kafka
+
+Click the short URL again. This time, the event should flow through
+to both consumers.
+
+
+>> TEST 6: SIMULATE CONSUMER CRASH <<
+
+Stop the click-writer:
+
+    docker compose stop click-writer
+
+Click the short URL 5 times.
+
+Check that events are in Kafka but not in Postgres:
+
+    docker compose exec kafka kafka-consumer-groups \
+      --bootstrap-server localhost:29092 \
+      --describe \
+      --group click-writer
+
+You should see LAG = 5.
+
+Start the click-writer:
+
+    docker compose start click-writer
+
+Watch the logs:
+
+    docker compose logs -f click-writer
+
+It should immediately process the 5 pending events. LAG goes to 0.
+This is the replay capability that BullMQ doesn't have at this level.
+
+
+>> TEST 7: TEST DEAD LETTER TOPIC <<
+
+Produce an invalid message:
+
+    docker compose exec kafka kafka-console-producer \
+      --bootstrap-server localhost:29092 \
+      --topic clicks
+
+Type:
+
+    this is not valid json
+
+Check the DLQ:
+
+    docker compose exec kafka kafka-console-consumer \
+      --bootstrap-server localhost:29092 \
+      --topic clicks-dlq \
+      --from-beginning
+
+You should see the failed event with error details.
+
+
+================================================================================
+UNDERSTANDING THE FULL ARCHITECTURE
+================================================================================
+
+Here's what your system looks like now:
+
+    User clicks short URL
+         │
+         ▼
+    ┌─────────┐
+    │  Nginx   │  (rate limiting, SSL, gzip)
+    └────┬─────┘
+         │
+         ▼
+    ┌──────────────────────┐
+    │    Fastify API        │
+    │                      │
+    │  1. Check Redis cache │──→ Redis (cache hit? redirect immediately)
+    │  2. Query Postgres    │──→ Postgres (cache miss? query DB, cache result)
+    │  3. Produce to Kafka  │──→ Kafka "clicks" topic (fire and forget)
+    │  4. Return 302        │
+    └──────────────────────┘
+                                      │
+                        ┌─────────────┼─────────────┐
+                        │             │             │
+                        ▼             ▼             ▼
+                   ┌─────────┐  ┌──────────┐  ┌─────────────┐
+                   │ Consumer │  │ Consumer │  │  (Future)   │
+                   │  Group:  │  │  Group:  │  │  analytics  │
+                   │ click-   │  │ click-   │  │  export     │
+                   │ writer   │  │ aggreg.  │  │             │
+                   └────┬─────┘  └────┬─────┘  └─────────────┘
+                        │             │
+                        ▼             ▼
+                   Postgres       Postgres
+                   (clicks)       (click_hourly_stats)
+
+    + Prometheus scrapes /metrics from the API
+    + Grafana visualizes everything
+    + Go CLI talks to the API from outside
+    + Dead letter topic catches failed events
+
+Compare this to Week 4's architecture:
+
+    BEFORE:  API → BullMQ (Redis) → 1 Worker → Postgres
+    AFTER:   API → Kafka → N Consumer Groups → Postgres (multiple tables)
+
+    What changed:
+    1. Event storage moved from Redis (RAM) to Kafka (disk) — durable
+    2. One-to-one delivery became one-to-many — extensible
+    3. Events are replayable — debuggable
+    4. Each consumer is a separate process — independently scalable
+    5. New consumers don't require producer changes — decoupled
+
+
+================================================================================
+COMMON GOTCHAS AND DEBUGGING
+================================================================================
+
+1. "LEADER NOT AVAILABLE" ERROR ON STARTUP:
+   Kafka hasn't finished initializing. Your app started before Kafka.
+   Fix: Use healthcheck + depends_on (we already have this).
+   If it still happens, increase retry.retries in the Kafka client config.
+
+2. "TOPIC DOES NOT EXIST" ERROR:
+   kafka-init container didn't run (or failed).
+   Fix: docker compose run --rm kafka-init
+
+3. CONSUMER NOT RECEIVING MESSAGES:
+   - Check groupId matches what you expect
+   - Check the topic name (typos!)
+   - Check consumer group offsets: kafka-consumer-groups --describe
+   - Check if fromBeginning matters for your case
+
+4. MESSAGES APPEAR IN WRONG CONSUMER:
+   If both consumers are in the SAME group, they share messages.
+   Each consumer must have a DIFFERENT groupId to get all messages.
+
+5. "REBALANCING" SPAM IN LOGS:
+   Happens when consumers keep connecting/disconnecting.
+   Usually caused by consumer taking too long to process a batch
+   (exceeds sessionTimeout). Fix: increase sessionTimeout or
+   decrease batch size.
+
+6. KAFKA USING TOO MUCH MEMORY:
+   Confluent's Kafka image defaults to 256MB heap. For local dev,
+   you might want to limit it:
+
+        kafka:
+          environment:
+            KAFKA_HEAP_OPTS: "-Xmx256m -Xms256m"
+
+7. "FETCH_SESSION_ID_NOT_FOUND" WARNINGS:
+   Harmless. Happens after broker restart. KafkaJS recovers automatically.
+
+8. OFFSETS NOT COMMITTING:
+   If you use eachBatchAutoResolve: false, you MUST call resolveOffset()
+   and commitOffsetsIfNecessary(). If you forget, offsets never advance
+   and the consumer reprocesses the same batch forever.
+
+
+================================================================================
+KAFKA CONCEPTS CHEAT SHEET
+================================================================================
+
+    Concept             What it is                     Compare to
+    ───────             ──────────                     ──────────
+    Topic               Named stream of events         BullMQ queue name
+    Partition           Ordered shard of a topic       BullMQ concurrency
+    Offset              Position in a partition        (no BullMQ equivalent)
+    Consumer Group      Team sharing partition work    BullMQ worker pool
+    Producer            Sends events to a topic        queue.add()
+    Broker              Server storing partitions      Redis server
+    Rebalance           Reassign partitions on change  BullMQ stalled job recovery
+    Dead Letter Topic   Where failed events go         BullMQ failed jobs
+    Retention           How long events are kept       removeOnComplete/Fail
+    Commit              Save consumer's position       (automatic in BullMQ)
+
+    Delivery Guarantees:
+    ─────────────────────
+    At-most-once   = commit offset BEFORE processing (may lose events)
+    At-least-once  = commit offset AFTER processing (may duplicate events)
+    Exactly-once   = transactional commit + dedup (complex, rarely needed)
+
+    TinyScale uses AT-LEAST-ONCE for click-writer (acceptable duplicates)
+    and AT-LEAST-ONCE with possible overcounting for click-aggregator.
+
+
+================================================================================
+CHECKPOINT: WHAT YOU SHOULD HAVE AFTER WEEK 5
+================================================================================
+
+1. KAFKA RUNNING IN DOCKER (KRaft mode, no Zookeeper)
+   - Single broker on port 9092 (host) / 29092 (containers)
+   - "clicks" topic with 3 partitions
+   - "clicks-dlq" topic with 1 partition
+   - kafka-init container creates topics on startup
+
+2. KAFKA PRODUCER IN YOUR API
+   - kafkaPlugin registers a producer on the Fastify instance
+   - Redirect handler produces click events to "clicks" topic
+   - Events keyed by urlId for partition affinity
+   - Fire-and-forget (doesn't block redirects)
+
+3. TWO INDEPENDENT CONSUMERS
+   - click-writer: reads clicks, batch INSERTs to Postgres clicks table
+   - click-aggregator: reads clicks, upserts hourly aggregates to
+     click_hourly_stats table
+   - Both run as separate Docker containers
+   - Both in different consumer groups (both get all events)
+
+4. ERROR HANDLING
+   - Dead letter topic for unparseable/permanently-failed events
+   - Graceful degradation when Kafka is down (redirects still work)
+   - kafkaHealthy flag prevents queuing send attempts to dead broker
+   - At-least-once delivery with manual offset commits
+
+5. UNDERSTANDING
+   - You can explain topics, partitions, offsets, consumer groups
+   - You know why Kafka is better than BullMQ for event streaming
+   - You understand the tradeoff between at-most-once and at-least-once
+   - You know how to debug with kafka-console-consumer and
+     kafka-consumer-groups
+   - You understand graceful degradation in distributed systems
+
+YOUR TINYSCALE ARCHITECTURE NOW:
+
+    User
+     │
+     ▼
+    Nginx (rate limit, SSL, gzip)
+     │
+     ▼
+    Fastify App (auth, routes, validation)
+     │
+     ├──→ Redis (cache, rate limits, leaderboard)
+     │
+     ├──→ Postgres (source of truth: users, urls)
+     │
+     ├──→ Kafka "clicks" topic (event stream)
+     │         │
+     │         ├──→ click-writer consumer → Postgres (clicks table)
+     │         │
+     │         ├──→ click-aggregator consumer → Postgres (click_hourly_stats)
+     │         │
+     │         └──→ clicks-dlq (dead letter topic for failed events)
+     │
+     └──→ /metrics → Prometheus → Grafana (dashboards)
+
+    Plus: Go CLI tool → API (from outside)
+
+WHAT TO PUT ON YOUR RESUME:
+- "Replaced Redis-based job queue (BullMQ) with Apache Kafka for event-driven analytics"
+- "Implemented 1-to-many event delivery with independent consumer groups"
+- "Built at-least-once delivery with manual offset management and dead letter topics"
+- "Designed graceful degradation — core redirect functionality survives Kafka outages"
+- "Pre-aggregated analytics data with hourly time-bucketed upserts"
+
+================================================================================
+END OF WEEK 5
+================================================================================
+
+NEXT WEEK: Week 6 is about testing and CI/CD — you'll write integration
+tests for your Kafka producers and consumers, set up GitHub Actions
+for automated testing, and learn about testcontainers for spinning up
+Kafka/Postgres in your test suite. But that's for next week. For now,
+make sure your Kafka pipeline works end-to-end: click a URL, see the
+event flow through both consumers, verify data in both Postgres tables,
+and confirm graceful degradation when Kafka is down.

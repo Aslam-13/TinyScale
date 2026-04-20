@@ -2,6 +2,7 @@ import { type FastifyRequest, type FastifyReply } from "fastify";
 import { createShortUrl, resolveShortCode } from "./url.service.js";
 import type { ShortenBody, RedirectParams } from "./url.schema.js";
 import { env } from "../../config/env.js";
+import { redirectsTotal } from "../../plugins/metrics.plugin.js";
 
 export async function shortenHandler(
   request: FastifyRequest<{ Body: ShortenBody }>,
@@ -43,6 +44,9 @@ export async function redirectHandler(
       clickedAt: new Date().toISOString(),
     })
     .catch((err) => request.log.error(err, "Failed to enqueue click"));
+
+  // Track redirect metric
+  redirectsTotal.inc();
 
   // Redirect immediately — don't wait for the queue
   return reply.redirect(url.originalUrl);

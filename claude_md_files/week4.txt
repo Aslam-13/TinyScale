@@ -1,0 +1,1554 @@
+================================================================================
+                    WEEK 4: GO BASICS + CLI TOOL + MONITORING
+                    ==========================================
+                    Your Goal: Learn Go basics, build a real CLI
+                    tool that talks to your TinyScale API, add
+                    Prometheus + Grafana monitoring, and read
+                    real open source code.
+================================================================================
+
+
+================================================================================
+DAY 1-3: GO CRASH COURSE + BUILD A CLI TOOL
+================================================================================
+
+BEFORE YOU WRITE ANY GO CODE - READ AND UNDERSTAND THIS:
+----------------------------------------------------------
+
+>> WHY GO? <<
+
+You've been writing TypeScript for weeks now. Why learn another language?
+
+1. GO IS EVERYWHERE IN INFRASTRUCTURE:
+   - Docker? Written in Go.
+   - Kubernetes? Written in Go.
+   - Prometheus? Written in Go.
+   - Terraform? Written in Go.
+   - Grafana? Written in Go.
+   If you work in backend/infrastructure, you WILL encounter Go.
+
+2. GO TEACHES YOU THINGS TYPESCRIPT CAN'T:
+   - Compiled language — you get a single binary (no node_modules, no runtime)
+   - Static typing without generics gymnastics (Go's type system is simpler)
+   - Goroutines — lightweight concurrency that's different from async/await
+   - Explicit error handling — no try/catch, you handle every error or ignore it
+
+3. GO IS SIMPLE ON PURPOSE:
+   - ~25 keywords (TypeScript has ~60+)
+   - No classes, no inheritance, no decorators, no overloading
+   - One way to do things, not five
+   - You can learn the syntax in a day. That's the point.
+
+>> HOW IS GO DIFFERENT FROM TYPESCRIPT? <<
+
+    TypeScript/Node.js                  Go
+    ------------------                  --
+    Interpreted (needs Node runtime)    Compiled (single binary)
+    node index.js                       go build -> ./myapp
+    npm install (node_modules/)         go mod (vendored, no node_modules)
+    async/await + event loop            goroutines + channels
+    try/catch for errors                if err != nil { return err }
+    Classes + interfaces                Structs + interfaces (no classes)
+    null/undefined                      Zero values (0, "", nil)
+    package.json                        go.mod
+    ~200MB node_modules                 ~10MB binary
+
+The biggest mental shift: In Go, errors are VALUES, not exceptions.
+
+    // TypeScript
+    try {
+        const data = await fetch(url);
+    } catch (err) {
+        console.error(err);
+    }
+
+    // Go
+    data, err := http.Get(url)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+This feels verbose at first. Then you realize: every error is visible. No hidden
+throws. No unhandled promise rejections. You know EXACTLY where things can fail.
+
+
+================================================================================
+STEP 1: INSTALL GO
+================================================================================
+
+Download and install Go from: https://go.dev/dl/
+
+Pick the installer for your OS (Windows — use the .msi installer).
+
+After installation, verify:
+
+    go version
+    # Should print: go version go1.22.x (or newer)
+
+Go installs to C:\Program Files\Go by default on Windows.
+Your Go workspace is at %USERPROFILE%\go (or ~/go on Linux/Mac).
+
+KEY ENVIRONMENT:
+    GOROOT = where Go is installed (C:\Program Files\Go)
+    GOPATH = where your packages go (~\go)
+    GOBIN  = where compiled binaries go (~\go\bin)
+
+You don't need to set these manually — Go sets sane defaults.
+
+
+================================================================================
+STEP 2: DO "A TOUR OF GO" (2-3 hours)
+================================================================================
+
+Go to: https://go.dev/tour/
+
+This is the OFFICIAL interactive tutorial. Do these sections:
+
+1. BASICS (must do):
+   - Packages, imports, exported names
+   - Functions, multiple return values
+   - Variables, short variable declarations (:=)
+   - Basic types (int, string, bool, float64)
+   - For loops (Go only has `for`, no while/do-while)
+   - If/else, switch
+   - Defer (runs when function exits — like finally)
+   - Pointers (yes, Go has pointers, but no pointer arithmetic)
+   - Structs (Go's version of objects/classes)
+   - Arrays, slices, maps
+
+2. METHODS AND INTERFACES (must do):
+   - Methods on structs
+   - Interfaces (implicit — no "implements" keyword!)
+   - Error interface (this is how Go does errors)
+   - Stringer interface (like toString())
+
+3. CONCURRENCY (read, but don't stress about mastering now):
+   - Goroutines
+   - Channels
+   - Select
+   - sync.Mutex
+
+Spend 2-3 hours on this. Don't rush, but don't get stuck.
+You'll learn the rest by building.
+
+
+================================================================================
+STEP 3: SET UP YOUR CLI PROJECT
+================================================================================
+
+Create a new directory for your Go CLI tool. This lives OUTSIDE your TinyScale
+Node.js project (it's a separate program that TALKS to your API):
+
+    mkdir ~/tinyscale-cli
+    cd ~/tinyscale-cli
+    go mod init tinyscale-cli
+
+This creates go.mod — like package.json for Go. That's it. No npm install,
+no node_modules, no 800 dependencies. Just go.mod.
+
+Now create your project structure:
+
+    tinyscale-cli/
+    |-- go.mod           <-- Module definition (like package.json)
+    |-- main.go          <-- Entry point
+    +-- cmd/             <-- Command implementations
+        |-- shorten.go
+        |-- stats.go
+        +-- health.go
+
+Go convention: main.go is the entry point. The `cmd/` directory holds
+subcommand logic. This is how almost every Go CLI is structured.
+
+
+================================================================================
+STEP 4: BUILD THE CLI — main.go (ENTRY POINT)
+================================================================================
+
+Create main.go:
+
+--- FILE: main.go ---
+
+    package main
+
+    import (
+        "fmt"
+        "os"
+
+        "tinyscale-cli/cmd"
+    )
+
+    // Base URL of your TinyScale API (running in Docker)
+    const defaultBaseURL = "http://localhost"
+
+    func main() {
+        if len(os.Args) < 2 {
+            printUsage()
+            os.Exit(1)
+        }
+
+        // First argument after the program name is the subcommand
+        subcommand := os.Args[1]
+
+        // Get base URL from environment variable, or use default
+        baseURL := os.Getenv("TINYSCALE_URL")
+        if baseURL == "" {
+            baseURL = defaultBaseURL
+        }
+
+        switch subcommand {
+        case "shorten":
+            cmd.Shorten(baseURL, os.Args[2:])
+        case "stats":
+            cmd.Stats(baseURL, os.Args[2:])
+        case "health":
+            cmd.Health(baseURL)
+        case "help", "--help", "-h":
+            printUsage()
+        default:
+            fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", subcommand)
+            printUsage()
+            os.Exit(1)
+        }
+    }
+
+    func printUsage() {
+        fmt.Println(`TinyScale CLI - manage your short URLs from the terminal
+
+    Usage:
+        tinyscale <command> [arguments]
+
+    Commands:
+        shorten <url> [--token <jwt>] [--api-key <key>]   Create a short URL
+        stats <code> [--token <jwt>] [--api-key <key>]     Get click stats for a short URL
+        health                                              Check if API, Redis, Postgres are up
+
+    Environment:
+        TINYSCALE_URL    Base URL of the API (default: http://localhost)
+        TINYSCALE_TOKEN  JWT token for authentication
+        TINYSCALE_KEY    API key for authentication
+
+    Examples:
+        tinyscale shorten https://example.com --token eyJhbG...
+        tinyscale stats Ax7bK2 --api-key sk_live_abc123
+        tinyscale health`)
+    }
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `package main` — Every Go program starts here. The `main` package with
+   a `main()` function is the entry point. Like `server.ts` in your Node app.
+
+2. `os.Args` — Like `process.argv` in Node. os.Args[0] is the program name,
+   os.Args[1] is the first argument, etc.
+
+3. `fmt.Fprintf(os.Stderr, ...)` — Go separates stdout and stderr.
+   Errors go to stderr, results go to stdout. This matters for piping:
+       tinyscale shorten https://example.com | pbcopy
+   Only the URL goes to stdout. Errors stay in the terminal.
+
+4. `os.Getenv("TINYSCALE_URL")` — Like `process.env.TINYSCALE_URL` in Node.
+
+5. No `async`, no `await`, no promises. Go functions just... run.
+   When they need to wait for I/O, the runtime handles it with goroutines.
+
+
+================================================================================
+STEP 5: BUILD THE SHORTEN COMMAND
+================================================================================
+
+Create cmd/shorten.go:
+
+--- FILE: cmd/shorten.go ---
+
+    package cmd
+
+    import (
+        "bytes"
+        "encoding/json"
+        "flag"
+        "fmt"
+        "io"
+        "net/http"
+        "os"
+    )
+
+    // ShortenResponse matches the JSON your TinyScale API returns
+    type ShortenResponse struct {
+        ID          string  `json:"id"`
+        ShortCode   string  `json:"shortCode"`
+        ShortURL    string  `json:"shortUrl"`
+        OriginalURL string  `json:"originalUrl"`
+        ExpiresAt   *string `json:"expiresAt"`
+        CreatedAt   string  `json:"createdAt"`
+    }
+
+    func Shorten(baseURL string, args []string) {
+        // Parse flags for this subcommand
+        fs := flag.NewFlagSet("shorten", flag.ExitOnError)
+        token := fs.String("token", "", "JWT token for authentication")
+        apiKey := fs.String("api-key", "", "API key for authentication")
+        expiresAt := fs.String("expires", "", "Expiration date (ISO 8601)")
+
+        // Parse the arguments (everything after "shorten")
+        if err := fs.Parse(args); err != nil {
+            fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
+            os.Exit(1)
+        }
+
+        // The URL to shorten is the first non-flag argument
+        if fs.NArg() < 1 {
+            fmt.Fprintln(os.Stderr, "Error: URL to shorten is required")
+            fmt.Fprintln(os.Stderr, "Usage: tinyscale shorten <url> [--token <jwt>] [--api-key <key>]")
+            os.Exit(1)
+        }
+        originalURL := fs.Arg(0)
+
+        // Fall back to environment variables if flags not provided
+        authToken := *token
+        if authToken == "" {
+            authToken = os.Getenv("TINYSCALE_TOKEN")
+        }
+        authKey := *apiKey
+        if authKey == "" {
+            authKey = os.Getenv("TINYSCALE_KEY")
+        }
+
+        if authToken == "" && authKey == "" {
+            fmt.Fprintln(os.Stderr, "Error: authentication required. Provide --token, --api-key, or set TINYSCALE_TOKEN/TINYSCALE_KEY")
+            os.Exit(1)
+        }
+
+        // Build the request body
+        body := map[string]string{"url": originalURL}
+        if *expiresAt != "" {
+            body["expiresAt"] = *expiresAt
+        }
+
+        jsonBody, err := json.Marshal(body)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+            os.Exit(1)
+        }
+
+        // Create the HTTP request
+        req, err := http.NewRequest("POST", baseURL+"/api/urls", bytes.NewReader(jsonBody))
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error creating request: %v\n", err)
+            os.Exit(1)
+        }
+        req.Header.Set("Content-Type", "application/json")
+
+        // Set authentication header
+        if authToken != "" {
+            req.Header.Set("Authorization", "Bearer "+authToken)
+        } else {
+            req.Header.Set("X-Api-Key", authKey)
+        }
+
+        // Send the request
+        client := &http.Client{}
+        resp, err := client.Do(req)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error: could not reach TinyScale API at %s\n", baseURL)
+            fmt.Fprintf(os.Stderr, "Details: %v\n", err)
+            os.Exit(1)
+        }
+        defer resp.Body.Close()
+
+        // Read the response body
+        respBody, err := io.ReadAll(resp.Body)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+            os.Exit(1)
+        }
+
+        // Handle non-2xx responses
+        if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            fmt.Fprintf(os.Stderr, "API error (HTTP %d): %s\n", resp.StatusCode, string(respBody))
+            os.Exit(1)
+        }
+
+        // Parse the successful response
+        var result ShortenResponse
+        if err := json.Unmarshal(respBody, &result); err != nil {
+            fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+            os.Exit(1)
+        }
+
+        // Output the short URL to stdout (for piping)
+        fmt.Println(result.ShortURL)
+
+        // Additional info to stderr (doesn't interfere with piping)
+        fmt.Fprintf(os.Stderr, "  Short code: %s\n", result.ShortCode)
+        fmt.Fprintf(os.Stderr, "  Original:   %s\n", result.OriginalURL)
+        fmt.Fprintf(os.Stderr, "  Created:    %s\n", result.CreatedAt)
+        if result.ExpiresAt != nil {
+            fmt.Fprintf(os.Stderr, "  Expires:    %s\n", *result.ExpiresAt)
+        }
+    }
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `json:"shortCode"` — These are "struct tags". They tell json.Marshal/Unmarshal
+   how to map JSON keys to struct fields. Like TypeBox schemas but built into the type.
+
+2. `*string` for ExpiresAt — A POINTER to a string. This means it can be `nil`
+   (like null in TypeScript). Regular `string` in Go can't be null — its zero
+   value is "" (empty string). Use pointers when a field can be absent.
+
+3. `defer resp.Body.Close()` — `defer` runs when the function exits.
+   This is Go's way of saying "don't forget to clean up." Like `finally` but
+   scoped to the function. Always close HTTP response bodies.
+
+4. `flag.NewFlagSet` — Go's built-in flag parsing. No npm install needed.
+   This handles --token, --api-key, etc. You're using the STANDARD LIBRARY
+   for something that would be a dependency (commander, yargs) in Node.
+
+5. `client.Do(req)` — The http package in Go's standard library is production-ready.
+   No axios, no node-fetch. The stdlib is enough for most HTTP work in Go.
+
+6. Error handling pattern:
+       value, err := someFunction()
+       if err != nil {
+           // handle error
+       }
+   This is EVERYWHERE in Go. Every function that can fail returns an error.
+   You check it immediately. No try/catch, no .catch(), no unhandled rejections.
+
+
+================================================================================
+STEP 6: BUILD THE STATS COMMAND
+================================================================================
+
+Create cmd/stats.go:
+
+--- FILE: cmd/stats.go ---
+
+    package cmd
+
+    import (
+        "encoding/json"
+        "flag"
+        "fmt"
+        "io"
+        "net/http"
+        "os"
+        "strings"
+        "time"
+    )
+
+    // StatsResponse matches your TinyScale /api/stats/:code response
+    type StatsResponse struct {
+        ShortCode   string  `json:"shortCode"`
+        OriginalURL string  `json:"originalUrl"`
+        TotalClicks int     `json:"totalClicks"`
+        CreatedAt   string  `json:"createdAt"`
+        Clicks      []Click `json:"clicks"`
+    }
+
+    type Click struct {
+        ID        string  `json:"id"`
+        Referrer  *string `json:"referrer"`
+        UserAgent *string `json:"userAgent"`
+        IP        *string `json:"ip"`
+        ClickedAt string  `json:"clickedAt"`
+    }
+
+    func Stats(baseURL string, args []string) {
+        fs := flag.NewFlagSet("stats", flag.ExitOnError)
+        token := fs.String("token", "", "JWT token for authentication")
+        apiKey := fs.String("api-key", "", "API key for authentication")
+
+        if err := fs.Parse(args); err != nil {
+            fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
+            os.Exit(1)
+        }
+
+        if fs.NArg() < 1 {
+            fmt.Fprintln(os.Stderr, "Error: short code is required")
+            fmt.Fprintln(os.Stderr, "Usage: tinyscale stats <code> [--token <jwt>] [--api-key <key>]")
+            os.Exit(1)
+        }
+        code := fs.Arg(0)
+
+        // Auth resolution (same pattern as shorten)
+        authToken := *token
+        if authToken == "" {
+            authToken = os.Getenv("TINYSCALE_TOKEN")
+        }
+        authKey := *apiKey
+        if authKey == "" {
+            authKey = os.Getenv("TINYSCALE_KEY")
+        }
+
+        if authToken == "" && authKey == "" {
+            fmt.Fprintln(os.Stderr, "Error: authentication required")
+            os.Exit(1)
+        }
+
+        // Build request
+        req, err := http.NewRequest("GET", baseURL+"/api/stats/"+code, nil)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error creating request: %v\n", err)
+            os.Exit(1)
+        }
+
+        if authToken != "" {
+            req.Header.Set("Authorization", "Bearer "+authToken)
+        } else {
+            req.Header.Set("X-Api-Key", authKey)
+        }
+
+        // Send request
+        client := &http.Client{}
+        resp, err := client.Do(req)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error: could not reach TinyScale API at %s\n", baseURL)
+            fmt.Fprintf(os.Stderr, "Details: %v\n", err)
+            os.Exit(1)
+        }
+        defer resp.Body.Close()
+
+        respBody, err := io.ReadAll(resp.Body)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+            os.Exit(1)
+        }
+
+        if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            fmt.Fprintf(os.Stderr, "API error (HTTP %d): %s\n", resp.StatusCode, string(respBody))
+            os.Exit(1)
+        }
+
+        var result StatsResponse
+        if err := json.Unmarshal(respBody, &result); err != nil {
+            fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+            os.Exit(1)
+        }
+
+        // Pretty print the stats
+        fmt.Println(strings.Repeat("=", 50))
+        fmt.Printf("  Stats for: %s\n", result.ShortCode)
+        fmt.Println(strings.Repeat("=", 50))
+        fmt.Printf("  Original URL:  %s\n", result.OriginalURL)
+        fmt.Printf("  Total Clicks:  %d\n", result.TotalClicks)
+        fmt.Printf("  Created At:    %s\n", formatTime(result.CreatedAt))
+        fmt.Println(strings.Repeat("-", 50))
+
+        if len(result.Clicks) == 0 {
+            fmt.Println("  No clicks yet.")
+        } else {
+            fmt.Println("  Recent Clicks:")
+            fmt.Println()
+            for i, click := range result.Clicks {
+                fmt.Printf("  %d. %s\n", i+1, formatTime(click.ClickedAt))
+                if click.Referrer != nil && *click.Referrer != "" {
+                    fmt.Printf("     Referrer:   %s\n", *click.Referrer)
+                }
+                if click.UserAgent != nil {
+                    // Truncate long user agents
+                    ua := *click.UserAgent
+                    if len(ua) > 60 {
+                        ua = ua[:60] + "..."
+                    }
+                    fmt.Printf("     User Agent: %s\n", ua)
+                }
+                if click.IP != nil {
+                    fmt.Printf("     IP:         %s\n", *click.IP)
+                }
+                fmt.Println()
+            }
+        }
+        fmt.Println(strings.Repeat("=", 50))
+    }
+
+    // formatTime converts an ISO 8601 string to a readable format
+    func formatTime(isoTime string) string {
+        t, err := time.Parse(time.RFC3339, isoTime)
+        if err != nil {
+            return isoTime // Return raw string if parsing fails
+        }
+        return t.Local().Format("Jan 02, 2006 03:04 PM")
+    }
+
+--- END OF FILE ---
+
+NEW THINGS TO UNDERSTAND:
+
+1. `range` — Go's way of iterating. `for i, click := range result.Clicks`
+   is like `result.clicks.forEach((click, i) => ...)` in JS.
+
+2. `time.Parse(time.RFC3339, isoTime)` — Go's time parsing uses a REFERENCE DATE:
+   Mon Jan 2 15:04:05 MST 2006. Yes, that specific date. It's Go's quirk.
+   RFC3339 is a predefined constant for ISO 8601 format.
+
+3. `strings.Repeat("=", 50)` — Stdlib again. No lodash needed.
+
+4. `t.Local()` — Converts UTC time to the user's local timezone.
+
+5. Notice there's no class. `formatTime` is just a function in the package.
+   Go doesn't force you into classes. Functions are fine.
+
+
+================================================================================
+STEP 7: BUILD THE HEALTH COMMAND
+================================================================================
+
+Create cmd/health.go:
+
+--- FILE: cmd/health.go ---
+
+    package cmd
+
+    import (
+        "encoding/json"
+        "fmt"
+        "io"
+        "net/http"
+        "os"
+        "time"
+    )
+
+    type HealthResponse struct {
+        Status string `json:"status"`
+        Redis  string `json:"redis"`
+        Queue  string `json:"queue"`
+    }
+
+    func Health(baseURL string) {
+        // Measure response time
+        start := time.Now()
+
+        resp, err := http.Get(baseURL + "/healthcheck")
+        if err != nil {
+            fmt.Println("  TinyScale API:  DOWN")
+            fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+            os.Exit(1)
+        }
+        defer resp.Body.Close()
+
+        elapsed := time.Since(start)
+
+        respBody, err := io.ReadAll(resp.Body)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
+            os.Exit(1)
+        }
+
+        if resp.StatusCode != 200 {
+            fmt.Println("  TinyScale API:  ERROR")
+            fmt.Fprintf(os.Stderr, "  HTTP %d: %s\n", resp.StatusCode, string(respBody))
+            os.Exit(1)
+        }
+
+        var health HealthResponse
+        if err := json.Unmarshal(respBody, &health); err != nil {
+            fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+            os.Exit(1)
+        }
+
+        // Pretty print health status
+        fmt.Println()
+        fmt.Println("  TinyScale Health Check")
+        fmt.Println("  ---------------------")
+
+        // API status
+        apiIcon := statusIcon(health.Status == "ok")
+        fmt.Printf("  %s API:        %s (%dms)\n", apiIcon, health.Status, elapsed.Milliseconds())
+
+        // Redis status
+        redisOk := health.Redis == "connected"
+        redisIcon := statusIcon(redisOk)
+        fmt.Printf("  %s Redis:      %s\n", redisIcon, health.Redis)
+
+        // Queue status
+        queueIcon := statusIcon(health.Queue != "error")
+        fmt.Printf("  %s Queue:      %s\n", queueIcon, health.Queue)
+
+        fmt.Println()
+
+        // Exit with error code if anything is unhealthy
+        if health.Status != "ok" || !redisOk {
+            os.Exit(1)
+        }
+    }
+
+    func statusIcon(ok bool) string {
+        if ok {
+            return "[OK]"
+        }
+        return "[!!]"
+    }
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `time.Now()` + `time.Since(start)` — Go's built-in timing. No `Date.now()`
+   or `performance.now()`. This returns a `Duration` type with methods like
+   `.Milliseconds()`, `.Seconds()`, etc.
+
+2. `http.Get(url)` — Shorthand for simple GET requests. For anything more
+   complex (custom headers, POST body), use `http.NewRequest` + `client.Do`.
+
+3. `os.Exit(1)` — Exit with a non-zero code. This matters for scripting:
+       tinyscale health && echo "All good" || echo "Something is down"
+   Scripts can check the exit code to decide what to do next.
+   This is how real CLI tools work — exit codes are part of the interface.
+
+
+================================================================================
+STEP 8: BUILD AND RUN YOUR CLI
+================================================================================
+
+Build the binary:
+
+    cd ~/tinyscale-cli
+    go build -o tinyscale .
+
+That's it. One command. You now have a `tinyscale` binary.
+No node_modules. No npm install. No runtime needed. Just one file.
+
+Check the file size:
+
+    ls -lh tinyscale
+    # Should be ~6-8MB — that's the ENTIRE program including Go runtime
+
+Compare that to your Node app:
+
+    du -sh ~/path/to/TinyScale/node_modules
+    # Probably 200-500MB
+
+This is one of Go's superpowers: a single, self-contained binary.
+
+Now test it:
+
+    # Make sure your TinyScale Docker setup is running
+    docker compose up -d
+
+    # Check health
+    ./tinyscale health
+
+    # Shorten a URL (you need a valid JWT token — get one by logging in)
+    # First, login via curl to get a token:
+    TOKEN=$(curl -s -X POST http://localhost/api/auth/login \
+        -H "Content-Type: application/json" \
+        -d '{"email":"your@email.com","password":"yourpassword"}' | jq -r '.token')
+
+    # Now use the CLI
+    ./tinyscale shorten https://github.com --token $TOKEN
+
+    # Check stats
+    ./tinyscale stats Ax7bK2 --token $TOKEN
+
+    # Or use environment variables (better for repeated use)
+    export TINYSCALE_TOKEN=$TOKEN
+    ./tinyscale shorten https://example.com
+    ./tinyscale stats Ax7bK2
+
+PRO TIP: On Windows, if you want to use the CLI from anywhere:
+
+    # Move the binary to your Go bin directory
+    go install .
+
+    # Or just use: go run . shorten https://example.com
+    # (go run compiles and runs in one step — good for development)
+
+
+================================================================================
+STEP 9: UNDERSTAND WHAT YOU JUST BUILT vs NODE.JS
+================================================================================
+
+Take a moment to compare the two approaches:
+
+    Node.js (your TinyScale API)           Go (your CLI tool)
+    ----------------------------           --------------------
+    Runtime: Node.js v20 (~100MB)          Runtime: compiled into binary
+    Dependencies: 50+ packages             Dependencies: 0 (stdlib only)
+    Start time: ~500ms                     Start time: instant
+    Distribution: need Node installed      Distribution: copy one file
+    Error handling: try/catch              Error handling: if err != nil
+    HTTP: fastify (framework)              HTTP: net/http (stdlib)
+    JSON: built-in                         JSON: encoding/json (stdlib)
+    Flag parsing: yargs/commander (npm)    Flag parsing: flag (stdlib)
+
+Neither is "better." They serve different purposes:
+- Node.js excels at web APIs (ecosystem, middleware, async I/O)
+- Go excels at CLI tools, infrastructure, services (small binary, fast startup, concurrency)
+
+The point of learning Go isn't to replace TypeScript. It's to have BOTH tools
+in your toolkit so you pick the right one for each job.
+
+
+================================================================================
+DAY 4-5: MONITORING AND OBSERVABILITY (PROMETHEUS + GRAFANA)
+================================================================================
+
+BEFORE YOU SET UP MONITORING - READ AND UNDERSTAND THIS:
+----------------------------------------------------------
+
+>> WHAT IS OBSERVABILITY? <<
+
+Right now, your TinyScale system is a black box. You can:
+- Check /healthcheck -> "ok" or not
+- Check /api/queue/stats -> some numbers
+- Read docker logs -> text scrolling by
+
+But you CAN'T answer:
+- "How many requests per second are we handling right now?"
+- "What's the average response time for redirects?"
+- "Is Redis hit rate going up or down?"
+- "Is the queue backing up?"
+- "Did something change at 3:47 PM that caused latency to spike?"
+
+Observability = the ability to understand what your system is doing
+from the OUTSIDE by looking at its OUTPUTS (metrics, logs, traces).
+
+Three pillars of observability:
+1. METRICS — Numbers that change over time (request count, response time, memory usage)
+2. LOGS — Text records of events (what you've been reading in Docker logs)
+3. TRACES — Following a single request through multiple services
+
+This week, we focus on METRICS using Prometheus + Grafana.
+
+>> WHAT IS PROMETHEUS? <<
+
+Prometheus is a time-series database that PULLS metrics from your services.
+
+The traditional approach:
+    Your app -> pushes metrics -> Metrics database
+    Problem: what if the push fails? What if the app is too busy to push?
+
+Prometheus's approach:
+    Prometheus -> pulls (scrapes) metrics from -> Your app's /metrics endpoint
+    Your app just exposes an HTTP endpoint. Prometheus handles the rest.
+
+The flow:
+    1. Your app exposes GET /metrics -> returns text in Prometheus format
+    2. Prometheus scrapes /metrics every 15 seconds
+    3. Prometheus stores the time-series data
+    4. Grafana queries Prometheus and draws pretty graphs
+
+>> WHAT IS GRAFANA? <<
+
+Grafana is a visualization tool. It connects to data sources (Prometheus,
+Postgres, Elasticsearch, etc.) and builds dashboards with graphs.
+
+Think of it this way:
+    Prometheus = the database that stores "CPU was 45% at 3:47 PM"
+    Grafana = the graph that shows you CPU over the last 24 hours
+
+In production, this is what your on-call engineer watches at 3 AM.
+
+
+================================================================================
+STEP 1: ADD PROMETHEUS METRICS TO YOUR NODE APP
+================================================================================
+
+Install the prom-client package:
+
+    npm install prom-client
+
+Now create a metrics plugin for Fastify:
+
+--- FILE: src/plugins/metrics.plugin.ts ---
+
+    import fp from "fastify-plugin";
+    import { type FastifyInstance, type FastifyRequest, type FastifyReply } from "fastify";
+    import client from "prom-client";
+
+    // Create a Registry — this holds all metrics
+    const register = new client.Registry();
+
+    // Add default Node.js metrics (memory, CPU, event loop lag, etc.)
+    client.collectDefaultMetrics({ register });
+
+    // === CUSTOM METRICS FOR TINYSCALE ===
+
+    // 1. HTTP request counter — how many requests, broken down by method, route, status
+    const httpRequestsTotal = new client.Counter({
+        name: "http_requests_total",
+        help: "Total number of HTTP requests",
+        labelNames: ["method", "route", "status_code"],
+        registers: [register],
+    });
+
+    // 2. HTTP request duration — how long requests take (histogram)
+    const httpRequestDuration = new client.Histogram({
+        name: "http_request_duration_seconds",
+        help: "Duration of HTTP requests in seconds",
+        labelNames: ["method", "route", "status_code"],
+        // Buckets define the boundaries for grouping response times
+        // This says: count responses in 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
+        buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+        registers: [register],
+    });
+
+    // 3. Redis cache hit/miss counter
+    export const cacheHitsTotal = new client.Counter({
+        name: "cache_hits_total",
+        help: "Total number of Redis cache hits",
+        registers: [register],
+    });
+
+    export const cacheMissesTotal = new client.Counter({
+        name: "cache_misses_total",
+        help: "Total number of Redis cache misses",
+        registers: [register],
+    });
+
+    // 4. Click queue depth gauge — how many jobs are waiting
+    export const queueDepthGauge = new client.Gauge({
+        name: "click_queue_depth",
+        help: "Number of jobs waiting in the click queue",
+        labelNames: ["state"],
+        registers: [register],
+    });
+
+    // 5. Redirect counter — specifically track redirects (the hot path)
+    export const redirectsTotal = new client.Counter({
+        name: "redirects_total",
+        help: "Total number of URL redirects served",
+        registers: [register],
+    });
+
+    export const metricsPlugin = fp(async (fastify: FastifyInstance) => {
+        // Hook into every request to track duration and count
+        fastify.addHook("onResponse", async (request: FastifyRequest, reply: FastifyReply) => {
+            // Skip the /metrics endpoint itself (avoid infinite recursion in metrics)
+            if (request.url === "/metrics") return;
+
+            const route = request.routeOptions?.url ?? request.url;
+            const method = request.method;
+            const statusCode = reply.statusCode.toString();
+
+            // Increment request counter
+            httpRequestsTotal.inc({ method, route, status_code: statusCode });
+
+            // Record request duration
+            const duration = reply.elapsedTime / 1000; // Fastify gives ms, Prometheus wants seconds
+            httpRequestDuration.observe(
+                { method, route, status_code: statusCode },
+                duration
+            );
+        });
+
+        // Expose GET /metrics endpoint for Prometheus to scrape
+        fastify.get("/metrics", async (request, reply) => {
+            reply.header("Content-Type", register.contentType);
+            return register.metrics();
+        });
+
+        fastify.log.info("Metrics plugin registered - GET /metrics available");
+    });
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. COUNTER — A value that only goes UP. Total requests, total errors, total clicks.
+   You can't subtract from a counter. To get "requests per second", Prometheus
+   uses the `rate()` function: rate(http_requests_total[5m]) = requests/sec over 5 min.
+
+2. HISTOGRAM — Records the DISTRIBUTION of values. Not just "average response time"
+   but "how many requests took 0-5ms, 5-10ms, 10-25ms, etc."
+   This is way more useful than averages. An average of 100ms could mean:
+   - All requests take ~100ms (good)
+   - 99% take 10ms, 1% take 9000ms (terrible — and the average hides it)
+   Histograms show you the REAL picture.
+
+3. GAUGE — A value that goes UP and DOWN. Queue depth, memory usage,
+   active connections. Unlike a counter, a gauge can decrease.
+
+4. LABELS — Dimensions that let you slice metrics. `method: "GET"`, `route: "/:code"`.
+   In Grafana, you can filter: "show me only GET requests to /:code with status 302".
+
+5. `reply.elapsedTime` — Fastify tracks request duration automatically.
+   We just convert it to seconds (Prometheus convention).
+
+
+================================================================================
+STEP 2: WIRE THE METRICS INTO YOUR APP
+================================================================================
+
+Update src/app.ts to register the metrics plugin:
+
+Add this import at the top:
+
+    import { metricsPlugin } from "./plugins/metrics.plugin.js";
+
+Register it AFTER the error handler (so it catches all routes):
+
+    // Error handler
+    registerErrorHandler(app);
+
+    // Metrics (after error handler so it tracks error responses too)
+    await app.register(metricsPlugin);
+
+Now update src/services/cache.service.ts to increment cache hit/miss counters:
+
+At the top, add the import:
+
+    import { cacheHitsTotal, cacheMissesTotal } from "../plugins/metrics.plugin.js";
+
+Inside the cacheGet function, where you have the Redis hit/miss logic,
+add counter increments:
+
+    // When cache HIT (data found in Redis):
+    cacheHitsTotal.inc();
+
+    // When cache MISS (had to query Postgres):
+    cacheMissesTotal.inc();
+
+ALSO: Update your redirect handler (src/modules/url/url.handler.ts) to
+track redirects:
+
+    import { redirectsTotal } from "../../plugins/metrics.plugin.js";
+
+    // Inside redirectHandler, right before the redirect:
+    redirectsTotal.inc();
+
+
+================================================================================
+STEP 3: ADD PROMETHEUS AND GRAFANA TO DOCKER-COMPOSE
+================================================================================
+
+First, create the Prometheus config file:
+
+    mkdir prometheus
+
+--- FILE: prometheus/prometheus.yml ---
+
+    # Global settings
+    global:
+      scrape_interval: 15s
+      # How often Prometheus pulls metrics from your services.
+      # 15 seconds is the default. In production, you might use 10s or 30s.
+      # Lower = more data points = more storage = more accurate graphs.
+
+      evaluation_interval: 15s
+      # How often Prometheus evaluates alerting rules.
+      # We won't set up alerts this week, but this is where it goes.
+
+    # What to scrape
+    scrape_configs:
+      # Prometheus scrapes itself (it exposes its own metrics)
+      - job_name: "prometheus"
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # Your TinyScale app
+      - job_name: "tinyscale"
+        static_configs:
+          - targets: ["app:3000"]
+        # "app" is the Docker service name — Docker DNS resolves it.
+        # Prometheus will GET http://app:3000/metrics every 15 seconds.
+        metrics_path: "/metrics"
+
+--- END OF FILE ---
+
+Now add Prometheus and Grafana to your docker-compose.yml.
+
+Add these to the `services:` section:
+
+    # ---- PROMETHEUS (metrics collection) ----
+    prometheus:
+      image: prom/prometheus:v2.51.0
+      ports:
+        - "9090:9090"
+        # Prometheus UI available at http://localhost:9090
+      volumes:
+        - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+        # Mount your config file. :ro = read-only (Prometheus doesn't modify it)
+        - prometheusdata:/prometheus
+        # Where Prometheus stores its time-series database
+      depends_on:
+        - app
+      networks:
+        - tinyscale-network
+      restart: unless-stopped
+
+    # ---- GRAFANA (visualization) ----
+    grafana:
+      image: grafana/grafana:10.4.0
+      ports:
+        - "3001:3000"
+        # Grafana runs on 3000 internally, but we map to 3001
+        # because your TinyScale app uses 3000 on host (via Nginx on 80)
+      volumes:
+        - grafanadata:/var/lib/grafana
+        # Grafana stores dashboards, data sources, users here
+      environment:
+        GF_SECURITY_ADMIN_USER: admin
+        GF_SECURITY_ADMIN_PASSWORD: admin
+        # Default login credentials. Change in production!
+      depends_on:
+        - prometheus
+      networks:
+        - tinyscale-network
+      restart: unless-stopped
+
+Also add the new volumes at the bottom:
+
+    volumes:
+      pgdata:
+      redisdata:
+      prometheusdata:
+      grafanadata:
+
+
+================================================================================
+STEP 4: START EVERYTHING AND VERIFY
+================================================================================
+
+Rebuild and start:
+
+    docker compose down
+    docker compose up --build -d
+
+Verify all services are running:
+
+    docker compose ps
+
+You should see: app, db, redis, nginx, prometheus, grafana all running.
+
+CHECK 1: Your app's /metrics endpoint:
+
+    curl http://localhost/metrics
+
+You should see text like:
+    # HELP http_requests_total Total number of HTTP requests
+    # TYPE http_requests_total counter
+    http_requests_total{method="GET",route="/healthcheck",status_code="200"} 1
+    ...
+    # HELP process_cpu_user_seconds_total Total user CPU time spent in seconds.
+    # TYPE process_cpu_user_seconds_total counter
+    ...
+
+This is Prometheus exposition format. Each line is a metric with labels and a value.
+
+CHECK 2: Prometheus is scraping your app:
+
+    Open http://localhost:9090 in your browser
+    Go to Status -> Targets
+    You should see "tinyscale" with state "UP"
+    If it says "DOWN", check that Prometheus can reach app:3000 on the Docker network.
+
+CHECK 3: Grafana is running:
+
+    Open http://localhost:3001 in your browser
+    Login: admin / admin
+    It'll ask you to change the password — skip or set one.
+
+
+================================================================================
+STEP 5: CONFIGURE GRAFANA DATA SOURCE
+================================================================================
+
+In Grafana UI:
+
+1. Go to Connections -> Data Sources (left sidebar, gear icon)
+2. Click "Add data source"
+3. Select "Prometheus"
+4. In the URL field, enter: http://prometheus:9090
+   (NOT localhost — Grafana talks to Prometheus inside Docker's network)
+5. Click "Save & Test" — should say "Data source is working"
+
+Now Grafana can query Prometheus.
+
+
+================================================================================
+STEP 6: BUILD YOUR TINYSCALE DASHBOARD IN GRAFANA
+================================================================================
+
+Go to Dashboards -> New -> New Dashboard -> Add visualization.
+
+Here are the panels to create. For each one, select "Prometheus" as the
+data source and enter the PromQL query.
+
+PANEL 1: Request Rate (requests per second)
+    Query: rate(http_requests_total[5m])
+    Legend: {{method}} {{route}} {{status_code}}
+    Type: Time series graph
+
+    WHAT THIS MEANS:
+    rate() calculates the per-second rate over a 5-minute window.
+    If you had 300 requests in the last 5 minutes, rate = 300/300 = 1 req/s.
+
+PANEL 2: Response Time (p50, p95, p99)
+    Query 1 (p50): histogram_quantile(0.5, rate(http_request_duration_seconds_bucket[5m]))
+    Query 2 (p95): histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+    Query 3 (p99): histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+    Type: Time series graph
+    Unit: seconds (in the axis settings)
+
+    WHAT THIS MEANS:
+    p50 = median (half of requests are faster than this)
+    p95 = 95th percentile (95% of requests are faster than this)
+    p99 = 99th percentile (only 1% of requests are slower)
+
+    WHY p95/p99 MATTER MORE THAN AVERAGE:
+    Average response time = 50ms sounds great.
+    But if p99 = 5000ms, that means 1 in 100 users waits 5 SECONDS.
+    At 1000 req/s, that's 10 users per second having a terrible experience.
+    Always monitor percentiles, not averages.
+
+PANEL 3: Cache Hit Rate
+    Query: rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m]))
+    Type: Stat (single number)
+    Unit: Percent (0.0-1.0)
+    Thresholds: Red < 0.5, Yellow < 0.8, Green >= 0.8
+
+    WHAT THIS MEANS:
+    hits / (hits + misses) = hit rate. If 80% of requests are served from Redis,
+    your cache hit rate is 0.8 (80%). Higher = better = less Postgres load.
+
+PANEL 4: Queue Depth
+    Query: click_queue_depth
+    Type: Time series graph
+    Legend: {{state}}
+
+    NOTE: To make this work, you need to periodically update the gauge.
+    Add this to your app.ts (inside the queue stats section or as a setInterval
+    in the app setup, after all plugins are registered):
+
+        import { queueDepthGauge } from "./plugins/metrics.plugin.js";
+
+        // Update queue depth metrics every 30 seconds
+        setInterval(async () => {
+            try {
+                const counts = await app.clickQueue.getJobCounts(
+                    "waiting", "active", "failed"
+                );
+                queueDepthGauge.set({ state: "waiting" }, counts.waiting);
+                queueDepthGauge.set({ state: "active" }, counts.active);
+                queueDepthGauge.set({ state: "failed" }, counts.failed);
+            } catch {
+                // Queue might not be ready yet
+            }
+        }, 30000);
+
+PANEL 5: Node.js Memory Usage
+    Query: process_resident_memory_bytes
+    Type: Time series graph
+    Unit: bytes (SI)
+
+    This comes from prom-client's default metrics (collectDefaultMetrics).
+    Shows how much RAM your Node.js process is using.
+
+PANEL 6: Redirects per Second
+    Query: rate(redirects_total[5m])
+    Type: Stat (single number)
+    Unit: req/s
+
+    The hot path metric — how many short URL redirects per second.
+
+PANEL 7: HTTP Error Rate
+    Query: rate(http_requests_total{status_code=~"5.."}[5m])
+    Type: Time series graph
+
+    WHAT THIS MEANS:
+    status_code=~"5.." is a REGEX — matches any 5xx status code.
+    This shows you when your app is returning server errors.
+    In production, you'd set an ALERT on this: "page me if error rate > 1%."
+
+Save your dashboard. Give it a name like "TinyScale Overview".
+
+
+================================================================================
+STEP 7: LOAD TEST AND WATCH THE DASHBOARD
+================================================================================
+
+This is where it gets satisfying. Run a load test and watch the graphs LIVE.
+
+If you have k6 from Week 2:
+
+--- FILE: k6/week4-load-test.js ---
+
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+
+    // Configure: ramp up to 50 users, hold for 2 minutes, ramp down
+    export const options = {
+        stages: [
+            { duration: '30s', target: 50 },   // Ramp up to 50 users
+            { duration: '2m', target: 50 },     // Hold at 50 users
+            { duration: '30s', target: 0 },     // Ramp down
+        ],
+    };
+
+    const BASE_URL = 'http://localhost';
+
+    export default function () {
+        // Mix of operations:
+        // 70% redirects (the hot path), 20% stats, 10% health checks
+        const rand = Math.random();
+
+        if (rand < 0.7) {
+            // Redirect — use a known short code
+            const res = http.get(`${BASE_URL}/YOUR_SHORT_CODE`, { redirects: 0 });
+            check(res, { 'redirect 302': (r) => r.status === 302 });
+        } else if (rand < 0.9) {
+            // Health check
+            const res = http.get(`${BASE_URL}/healthcheck`);
+            check(res, { 'health 200': (r) => r.status === 200 });
+        } else {
+            // Stats (needs auth — replace with your token)
+            const res = http.get(`${BASE_URL}/api/stats/YOUR_SHORT_CODE`, {
+                headers: { 'Authorization': 'Bearer YOUR_TOKEN' },
+            });
+            check(res, { 'stats 200': (r) => r.status === 200 });
+        }
+
+        sleep(0.1); // Small delay between requests
+    }
+
+--- END OF FILE ---
+
+Run it:
+
+    k6 run k6/week4-load-test.js
+
+Now open your Grafana dashboard (http://localhost:3001) and watch in real time:
+- Request rate climbing as k6 ramps up
+- Response time increasing under load
+- Cache hit rate stabilizing
+- Memory usage growing
+- Redirects per second peaking
+
+THIS IS WHAT PRODUCTION MONITORING LOOKS LIKE.
+
+When something goes wrong at 3 AM and you get paged, this dashboard is the
+first thing you look at. You can see WHEN something changed and correlate it
+with deployments, traffic spikes, or infrastructure issues.
+
+
+================================================================================
+DAY 6-7: READ REAL OPEN SOURCE CODE
+================================================================================
+
+>> WHY READ OTHER PEOPLE'S CODE? <<
+
+You've been WRITING code for 4 weeks. Now it's time to READ code.
+
+Reading production-quality code teaches you:
+1. Patterns you'd never discover on your own
+2. How to handle edge cases you haven't thought of
+3. What "good code" looks like at scale
+4. How your dependencies actually work
+
+Most developers NEVER read the source of their dependencies.
+That's why they can't debug issues and blindly copy Stack Overflow answers.
+
+You're going to be different.
+
+
+================================================================================
+STEP 1: READ BULLMQ SOURCE (you're already using it)
+================================================================================
+
+Clone or browse on GitHub: https://github.com/taskforcesh/bullmq
+
+Focus on these files:
+
+FILE 1: src/classes/worker.ts
+    This is the Worker you're using in your click-worker.ts.
+
+    Questions to answer by reading:
+    - How does the worker KNOW when a new job arrives? (Hint: Redis BRPOPLPUSH)
+    - What happens when the worker crashes mid-job? (Look for "stalled jobs")
+    - How does concurrency work? (Look for how it limits parallel processors)
+    - What is the "lock" mechanism? (Jobs are locked while being processed)
+
+    Key code to find:
+    - The main processing loop
+    - Where it calls YOUR processor function
+    - How it marks a job as completed vs failed
+    - How retry logic works
+
+FILE 2: src/classes/queue.ts
+    This is the Queue you're using to add jobs.
+
+    Questions to answer:
+    - How is a job stored in Redis? (What Redis data structure?)
+    - What happens when you call queue.add()? (What Redis commands run?)
+    - How are job options (attempts, backoff) stored?
+
+FILE 3: src/classes/scripts.ts (or the Lua scripts directory)
+    BullMQ uses Lua scripts for atomic Redis operations.
+
+    Questions to answer:
+    - Why Lua scripts instead of multiple Redis commands?
+      (Hint: atomicity — the script runs as a single Redis operation)
+    - What would go wrong without Lua scripts?
+      (Hint: race conditions between multiple workers)
+
+HOW TO READ:
+    Don't read top to bottom. Start from what you KNOW:
+    1. You call `worker = new Worker(queueName, processor, options)`
+    2. Find the Worker constructor -> what does it set up?
+    3. Follow the chain: constructor -> starts processing -> pulls job ->
+       calls your function -> handles result
+    4. When you hit something confusing, write it down and come back later.
+
+EXPECTED TIME: 2-3 hours. You won't understand everything. That's normal.
+Understanding 30% of a production codebase is more valuable than understanding
+100% of a tutorial.
+
+
+================================================================================
+STEP 2: READ FASTIFY SOURCE (your web framework)
+================================================================================
+
+Browse: https://github.com/fastify/fastify
+
+Focus on: The routing system.
+
+Fastify is fast because of how it matches URLs to handlers.
+Most frameworks (Express) use regex matching — slow for many routes.
+Fastify uses a RADIX TREE (via find-my-way).
+
+FILE 1: Read https://github.com/delvedor/find-my-way (Fastify's router)
+    This is a separate package. It's small enough to read in full.
+
+    Start with: index.js -> the `on()` method (adds a route) and
+    `lookup()` method (finds the handler for a URL)
+
+    Questions to answer:
+    - What is a radix tree? How is it different from an array of regex patterns?
+    - Why is a radix tree faster for URL matching?
+    - How does it handle dynamic params like /:code?
+    - What happens when two routes conflict?
+
+FILE 2: Back in Fastify — lib/route.js
+    How does Fastify use find-my-way?
+
+    Questions to answer:
+    - When you call app.get("/:code", handler), what happens internally?
+    - Where are hooks (preHandler, onResponse) stored and executed?
+    - How does the request lifecycle work?
+      (onRequest -> preParsing -> preValidation -> preHandler ->
+       handler -> onSend -> onResponse)
+
+VISUAL OF RADIX TREE:
+
+    Given routes:
+        /api/auth/login
+        /api/auth/register
+        /api/stats/:code
+        /api/urls
+        /:code
+
+    The radix tree looks like:
+
+                    (root)
+                   /      \
+                /api/       /:code
+               /    \
+            auth/   stats/    urls
+           /    \       \
+        login  register  :code
+
+    To match "/api/auth/login":
+    1. Start at root -> match "/api/" -> go left
+    2. Match "auth/" -> go left
+    3. Match "login" -> found! Return handler.
+    4. Total comparisons: 3 (not N regex matches)
+
+    With 1000 routes, regex matching = test up to 1000 patterns.
+    Radix tree matching = test ~5-10 nodes. That's why Fastify is fast.
+
+
+================================================================================
+STEP 3: READ IOREDIS SOURCE (your Redis client)
+================================================================================
+
+Browse: https://github.com/redis/ioredis
+
+This is a smaller scope. Focus on ONE thing: how does ioredis maintain
+the connection to Redis?
+
+FILE: lib/Redis.ts (the main class)
+
+    Questions to answer:
+    - What happens when you do `new Redis("redis://localhost:6379")`?
+    - How does it handle disconnection and reconnection?
+    - What is "command queuing"? (Commands sent while disconnected are queued)
+    - How does pipelining work? (Send multiple commands without waiting for responses)
+
+This is relevant to YOUR system: when Redis goes down temporarily, ioredis
+doesn't crash — it queues commands and replays them on reconnection.
+This is why your cache service's try/catch (graceful degradation) works
+alongside ioredis's built-in resilience.
+
+
+================================================================================
+CHECKPOINT: WHAT YOU SHOULD HAVE AFTER WEEK 4
+================================================================================
+
+1. A WORKING GO CLI TOOL (tinyscale-cli/)
+   - `tinyscale shorten <url>` -> creates short URLs via your API
+   - `tinyscale stats <code>` -> shows click analytics
+   - `tinyscale health` -> checks all services
+   - Uses ONLY Go standard library (no dependencies)
+   - Compiles to a single ~7MB binary
+
+2. PROMETHEUS + GRAFANA MONITORING
+   - prom-client exposing /metrics in your Fastify app
+   - Prometheus scraping metrics every 15 seconds
+   - Grafana dashboard with 7 panels:
+     - Request rate, response time percentiles
+     - Cache hit rate, queue depth
+     - Memory usage, error rate, redirect throughput
+   - You can watch the dashboard during load tests
+
+3. UNDERSTANDING OF REAL CODEBASES
+   - You've read BullMQ's worker loop and know how jobs are processed
+   - You've read Fastify's radix tree router and know why it's fast
+   - You've read ioredis's connection handling
+
+4. MENTAL MODEL
+   - You understand the difference between compiled (Go) and interpreted (Node)
+   - You understand metrics (counters, histograms, gauges) and why percentiles > averages
+   - You can explain how Prometheus pull-based scraping works
+   - You know what a production monitoring setup looks like
+
+YOUR TINYSCALE ARCHITECTURE NOW:
+
+    User
+     |
+     v
+    Nginx (rate limit, SSL, gzip)
+     |
+     v
+    Fastify App (auth, routes, validation)
+     |
+     |---> Redis (cache, rate limits, queue)
+     |      |
+     |      +--> Click Worker (batch INSERT to Postgres)
+     |
+     |---> Postgres (source of truth)
+     |
+     +--> /metrics --> Prometheus --> Grafana (dashboards)
+
+    Plus: Go CLI tool --> API (from outside)
+
+WHAT TO PUT ON YOUR RESUME:
+- "Built a Go CLI tool using only the standard library"
+- "Implemented Prometheus metrics + Grafana dashboards for production monitoring"
+- "Tracked p50/p95/p99 response times, cache hit rates, and queue depth"
+- "Reduced debugging time by having real-time visibility into system behavior"
+
+================================================================================
+END OF WEEK 4
+================================================================================
+
+NEXT WEEK: Week 5 is Kafka + Event-Driven Architecture — you'll replace
+BullMQ with Kafka for the analytics pipeline and learn about distributed
+messaging. But that's for next week. For now, make sure your Go CLI works,
+your dashboard is live, and you've spent at least 4-5 hours reading open
+source code.

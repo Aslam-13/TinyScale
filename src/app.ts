@@ -6,6 +6,8 @@ import { authPlugin } from "./plugins/auth.plugin.js";
 import { rateLimitPlugin } from "./plugins/rate-limit.plugin.js";
 import { queuePlugin } from "./plugins/queue.plugin.js";
 import { registerErrorHandler } from "./errors/error-handler.js";
+import { metricsPlugin } from "./plugins/metrics.plugin.js";
+import { queueDepthGauge } from "./plugins/metrics.plugin.js";
 import { authRoutes } from "./modules/auth/auth.routes.js";
 import { urlRoutes } from "./modules/url/url.routes.js";
 import { statsRoutes } from "./modules/stats/stats.routes.js";
@@ -32,6 +34,9 @@ export async function buildApp(opts: BuildAppOptions = {}) {
 
   // Error handler
   registerErrorHandler(app);
+
+  // Metrics (after error handler so it tracks error responses too)
+  await app.register(metricsPlugin);
 
   // API key auth as a fallback — runs before authenticate preHandler
   app.addHook("preHandler", async (request, reply) => {
@@ -89,6 +94,20 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await app.register(authRoutes);
   await app.register(urlRoutes);
   await app.register(statsRoutes);
+
+  // Update queue depth metrics every 30 seconds
+  setInterval(async () => {
+    try {
+      const counts = await app.clickQueue.getJobCounts(
+        "waiting", "active", "failed"
+      );
+      queueDepthGauge.set({ state: "waiting" }, counts.waiting);
+      queueDepthGauge.set({ state: "active" }, counts.active);
+      queueDepthGauge.set({ state: "failed" }, counts.failed);
+    } catch {
+      // Queue might not be ready yet
+    }
+  }, 30000);
 
   return app;
 }

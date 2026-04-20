@@ -1,0 +1,2123 @@
+================================================================================
+                    WEEK 8: CI/CD + TESTING PIPELINE + SECURITY
+                    + DATABASE OPERATIONS
+                    =============================================
+                    Your Goal: Automate everything. Never deploy
+                    manually again. Harden your app against real
+                    attacks. Learn production database operations.
+================================================================================
+
+
+================================================================================
+DAY 1-2: GITHUB ACTIONS CI/CD
+================================================================================
+
+BEFORE YOU WRITE ANY YAML - READ AND UNDERSTAND THIS:
+-------------------------------------------------------
+
+>> WHAT IS CI/CD? <<
+
+CI  = Continuous Integration — automatically test every code change
+CD  = Continuous Deployment  — automatically deploy tested code to production
+
+Right now, your deployment process is probably something like this:
+
+    1. Write code
+    2. Maybe run tests (if you remember)
+    3. docker compose build
+    4. docker compose up
+    5. Manually check if things work
+    6. Push to GitHub
+
+This is fine for a hobby project. It's CATASTROPHIC for a real system.
+
+Here's what goes wrong:
+
+    Developer A pushes code that passes on their machine.
+    Developer B pulls it — tests fail because A forgot to run them.
+    Someone deploys to production without running the linter.
+    A type error makes it to production because nobody ran `tsc --noEmit`.
+    Someone pushes a broken Docker image because they forgot to build.
+
+CI/CD prevents ALL of this by making the machine do it. Every. Single. Time.
+
+>> WHY GITHUB ACTIONS? <<
+
+    CI/CD Tool           Who Uses It              Free Tier
+    ---------------      --------------------     -------------------------
+    GitHub Actions       GitHub-hosted repos      2,000 min/month (free)
+    Jenkins              Self-hosted (legacy)     Free (you host it)
+    GitLab CI            GitLab repos             400 min/month
+    CircleCI             Any Git repo             6,000 min/month
+    Travis CI            Open source              Free for open source
+
+GitHub Actions is the obvious choice because:
+1. Your code is already on GitHub.
+2. It's free for public repos and generous for private ones.
+3. YAML-based — same declarative approach you use for Docker Compose and K8s.
+4. Runs in ephemeral containers — no "works on my machine" problems.
+
+>> HOW DOES GITHUB ACTIONS WORK? <<
+
+The key concepts:
+
+    Workflow  = A YAML file in .github/workflows/ that defines automation
+    Trigger   = What starts the workflow (push, PR, schedule, manual)
+    Job       = A set of steps that run on a virtual machine (runner)
+    Step      = A single command or action within a job
+    Action    = A reusable piece of CI/CD logic (like npm packages for CI)
+    Runner    = The virtual machine that executes your jobs
+
+The hierarchy:
+
+    Workflow
+    |-- Trigger (on push, on PR, etc.)
+    |-- Job 1 (runs on ubuntu-latest)
+    |   |-- Step 1: Checkout code
+    |   |-- Step 2: Install dependencies
+    |   |-- Step 3: Run tests
+    |
+    |-- Job 2 (runs AFTER Job 1)
+        |-- Step 1: Build Docker image
+        |-- Step 2: Push to registry
+
+Jobs run in PARALLEL by default. If Job 2 needs Job 1 to finish,
+you use `needs: job1`.
+
+
+================================================================================
+STEP 1: CREATE YOUR CI WORKFLOW (ci.yml)
+================================================================================
+
+This workflow runs on EVERY push and pull request. It checks three things:
+1. Code style (ESLint)
+2. Type safety (tsc --noEmit)
+3. Tests pass
+
+Create the directory structure:
+
+    mkdir -p .github/workflows
+
+--- FILE: .github/workflows/ci.yml ---
+
+    name: CI Pipeline
+
+    # WHEN does this run?
+    on:
+      push:
+        branches: [main, develop]    # Every push to main or develop
+      pull_request:
+        branches: [main]             # Every PR targeting main
+
+    # WHAT environment variables are shared across all jobs?
+    env:
+      NODE_VERSION: '20'
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: tinyscale_test
+
+    jobs:
+      # ---------------------------------------------------------------
+      # JOB 1: Lint + Type Check
+      # These are fast (<30 seconds) so we run them first
+      # ---------------------------------------------------------------
+      lint-and-typecheck:
+        name: Lint & Type Check
+        runs-on: ubuntu-latest
+
+        steps:
+          # Step 1: Get the code
+          - name: Checkout code
+            uses: actions/checkout@v4
+
+          # Step 2: Set up Node.js with caching
+          - name: Setup Node.js
+            uses: actions/setup-node@v4
+            with:
+              node-version: ${{ env.NODE_VERSION }}
+              cache: 'npm'     # Caches node_modules between runs
+
+          # Step 3: Install dependencies
+          - name: Install dependencies
+            run: npm ci
+            # npm ci (not npm install!) — uses lockfile exactly
+            # Faster AND more reliable than npm install
+
+          # Step 4: Run ESLint
+          - name: Run linter
+            run: npx eslint src/ --ext .ts
+
+          # Step 5: Run TypeScript compiler (type check only, no emit)
+          - name: Type check
+            run: npx tsc --noEmit
+
+      # ---------------------------------------------------------------
+      # JOB 2: Run Tests
+      # This needs a Postgres service for integration tests
+      # ---------------------------------------------------------------
+      test:
+        name: Run Tests
+        runs-on: ubuntu-latest
+
+        # GitHub Actions can spin up Docker services for your tests!
+        # This is like having a docker-compose for CI.
+        services:
+          postgres:
+            image: postgres:16
+            env:
+              POSTGRES_USER: ${{ env.POSTGRES_USER }}
+              POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+              POSTGRES_DB: ${{ env.POSTGRES_DB }}
+            ports:
+              - 5432:5432
+            # Health check — wait until Postgres is actually ready
+            options: >-
+              --health-cmd "pg_isready -U dev"
+              --health-interval 10s
+              --health-timeout 5s
+              --health-retries 5
+
+          redis:
+            image: redis:7-alpine
+            ports:
+              - 6379:6379
+            options: >-
+              --health-cmd "redis-cli ping"
+              --health-interval 10s
+              --health-timeout 5s
+              --health-retries 5
+
+        steps:
+          - name: Checkout code
+            uses: actions/checkout@v4
+
+          - name: Setup Node.js
+            uses: actions/setup-node@v4
+            with:
+              node-version: ${{ env.NODE_VERSION }}
+              cache: 'npm'
+
+          - name: Install dependencies
+            run: npm ci
+
+          # Run Drizzle migrations against the test database
+          - name: Run database migrations
+            run: npx drizzle-kit push
+            env:
+              DATABASE_URL: postgres://dev:dev@localhost:5432/tinyscale_test
+
+          # Run tests with the test database
+          - name: Run tests
+            run: npm test
+            env:
+              DATABASE_URL: postgres://dev:dev@localhost:5432/tinyscale_test
+              REDIS_URL: redis://localhost:6379
+              JWT_SECRET: ci-test-secret
+              NODE_ENV: test
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `npm ci` vs `npm install`:
+   - `npm install` reads package.json and RESOLVES versions (could change)
+   - `npm ci` reads package-lock.json EXACTLY (deterministic, faster)
+   - ALWAYS use `npm ci` in CI. If lockfile is out of sync, it fails. Good.
+
+2. `actions/checkout@v4` — This is a GitHub-maintained Action that clones
+   your repo into the runner. Without this, your code isn't there at all.
+   The @v4 is a version tag — pin your actions to major versions.
+
+3. `services:` — GitHub Actions can run Docker containers alongside your
+   job. This is how you get a real Postgres and Redis for integration tests.
+   Compare this to your docker-compose.yml — same concept, different syntax.
+
+4. `--health-cmd` — The CI runner waits until Postgres responds to
+   `pg_isready` before starting your tests. Without this, your tests
+   might start before the database is ready (flaky tests!).
+
+5. `tsc --noEmit` — Runs the TypeScript compiler but doesn't produce any
+   output files. It ONLY checks types. This catches type errors that
+   ESLint misses. Together, they catch 90% of bugs before tests even run.
+
+6. Why two jobs instead of one? SPEED. `lint-and-typecheck` doesn't need
+   Postgres or Redis. It finishes in ~30 seconds. If it fails, you know
+   instantly — no need to wait for the full test suite.
+
+
+================================================================================
+STEP 2: CREATE THE DOCKER PUBLISH WORKFLOW (docker-publish.yml)
+================================================================================
+
+This workflow runs ONLY when code is merged to main. It:
+1. Builds the Docker image
+2. Pushes it to GitHub Container Registry (ghcr.io)
+3. Tags it with the commit SHA and "latest"
+
+>> WHAT IS GITHUB CONTAINER REGISTRY (GHCR)? <<
+
+    Container Registry          Who Uses It
+    -------------------         ---------------------------
+    Docker Hub                  Default public registry
+    ghcr.io (GitHub)            Free with GitHub account
+    Amazon ECR                  AWS projects
+    Google Artifact Registry    GCP projects
+    Azure Container Registry    Azure projects
+
+GHCR is ideal because:
+- It's FREE for public repos (and 500MB free for private)
+- It's tied to your GitHub account — no separate login
+- It uses the same authentication as your GitHub Actions
+- Images are at: ghcr.io/YOUR_USERNAME/tinyscale
+
+--- FILE: .github/workflows/docker-publish.yml ---
+
+    name: Build & Publish Docker Image
+
+    on:
+      push:
+        branches: [main]     # Only on merge to main
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}   # owner/repo-name
+
+    jobs:
+      # First, run tests (don't publish a broken image!)
+      test:
+        name: Run Tests Before Publishing
+        uses: ./.github/workflows/ci.yml     # Reuse the CI workflow!
+        # This means: run the ENTIRE ci.yml pipeline first.
+        # If any job in ci.yml fails, we don't publish.
+
+      build-and-push:
+        name: Build & Push Docker Image
+        runs-on: ubuntu-latest
+        needs: test                          # Only run if tests pass
+
+        # Required for pushing to GHCR
+        permissions:
+          contents: read
+          packages: write
+
+        steps:
+          - name: Checkout code
+            uses: actions/checkout@v4
+
+          # Log into GitHub Container Registry
+          - name: Log in to GHCR
+            uses: docker/login-action@v3
+            with:
+              registry: ${{ env.REGISTRY }}
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+              # GITHUB_TOKEN is automatically provided — no setup needed!
+
+          # Extract metadata for Docker tags
+          - name: Extract Docker metadata
+            id: meta
+            uses: docker/metadata-action@v5
+            with:
+              images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+              tags: |
+                type=sha,prefix=
+                type=raw,value=latest
+
+          # Build and push the Docker image
+          - name: Build and push Docker image
+            uses: docker/build-push-action@v5
+            with:
+              context: .
+              push: true
+              tags: ${{ steps.meta.outputs.tags }}
+              labels: ${{ steps.meta.outputs.labels }}
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `needs: test` — This creates a dependency chain:
+       test (ci.yml) -> build-and-push
+   If any test fails, the Docker image is NEVER built. This is the entire
+   point of CI/CD — bad code never reaches production.
+
+2. `secrets.GITHUB_TOKEN` — GitHub automatically provides this token to
+   every workflow run. You don't need to create it. It has permissions to
+   push packages to GHCR for your repository.
+
+3. `permissions:` — Explicit permission declaration. The job needs:
+   - `contents: read` — to checkout the code
+   - `packages: write` — to push to GHCR
+   Following the principle of least privilege.
+
+4. Image tagging strategy:
+   - `type=sha` -> ghcr.io/you/tinyscale:a1b2c3d (commit hash)
+   - `type=raw,value=latest` -> ghcr.io/you/tinyscale:latest
+
+   The SHA tag lets you deploy ANY specific version.
+   The "latest" tag is a convenience for development.
+   In production, NEVER use :latest — always pin to a specific SHA.
+
+5. `uses: ./.github/workflows/ci.yml` — Reusable workflows. Instead of
+   copy-pasting the CI steps, you reference the other workflow file.
+   DRY principle applies to CI/CD too.
+
+NOTE: For the reusable workflow to work, you need to add this trigger
+to the TOP of ci.yml:
+
+    on:
+      push:
+        branches: [main, develop]
+      pull_request:
+        branches: [main]
+      workflow_call:             # <-- ADD THIS LINE
+        # This allows other workflows to call this one
+
+Without `workflow_call`, the `uses: ./.github/workflows/ci.yml` line
+will fail with "workflow is not reusable".
+
+
+================================================================================
+STEP 3: ENABLE GITHUB CONTAINER REGISTRY
+================================================================================
+
+Before your first push to GHCR, you need to do ONE setup step:
+
+1. Go to GitHub.com -> Your profile -> Settings -> Developer settings
+   -> Personal access tokens -> Tokens (classic)
+
+2. Create a new token with these scopes:
+   - `read:packages`
+   - `write:packages`
+   - `delete:packages` (optional, for cleanup)
+
+   BUT WAIT — you actually DON'T need this for GitHub Actions! The
+   automatic GITHUB_TOKEN handles it. You only need a PAT if you're
+   pushing from your LOCAL machine.
+
+3. To pull your published image locally:
+
+    # Login to GHCR from your terminal
+    echo $GITHUB_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
+
+    # Pull your image
+    docker pull ghcr.io/YOUR_USERNAME/tinyscale:latest
+
+    # Run it
+    docker run -p 3000:3000 ghcr.io/YOUR_USERNAME/tinyscale:latest
+
+4. To verify your image was published:
+   Go to GitHub.com -> Your repo -> Packages (right sidebar)
+   You should see your Docker image listed there.
+
+
+================================================================================
+STEP 4: TEST YOUR CI/CD PIPELINE
+================================================================================
+
+Do this NOW to verify everything works:
+
+    # 1. Create a feature branch
+    git checkout -b feat/add-cicd
+
+    # 2. Add the workflow files
+    git add .github/workflows/ci.yml .github/workflows/docker-publish.yml
+    git commit -m "feat: add CI/CD pipeline with GitHub Actions"
+
+    # 3. Push and create a PR
+    git push -u origin feat/add-cicd
+
+    # 4. Go to GitHub -> your repo -> Actions tab
+    #    You should see the CI Pipeline running!
+
+    # 5. Open a PR from feat/add-cicd -> main
+    #    The CI pipeline should run on the PR too.
+    #    GitHub will show check marks next to each job.
+
+    # 6. Merge the PR
+    #    Now the docker-publish workflow should trigger.
+    #    Check the Actions tab — you should see the image being built and pushed.
+
+WHAT IF THE CI FAILS? Good. That's the point. Read the error:
+- Red X on "Lint & Type Check" -> You have a lint error or type error. Fix it.
+- Red X on "Run Tests" -> A test is failing. Check the logs.
+- Red X on "Build & Push" -> Your Dockerfile is broken. Build locally first.
+
+>> COMPARE THIS TO YOUR CURRENT WORKFLOW <<
+
+Before CI/CD:
+
+    You: "I think the code works"
+    You: *deploys*
+    Production: *crashes*
+    You: "Oh, I forgot to run tests"
+
+After CI/CD:
+
+    GitHub Actions: "Your lint failed on line 47"
+    You: *fixes it before anyone sees*
+    GitHub Actions: "All checks passed"
+    You: *merges with confidence*
+
+This is the difference between a hobby project and a professional one.
+
+
+================================================================================
+DAY 3-4: SECURITY FUNDAMENTALS
+================================================================================
+
+BEFORE YOU ADD ANY SECURITY HEADERS - READ AND UNDERSTAND THIS:
+-----------------------------------------------------------------
+
+>> WHY SECURITY? <<
+
+You built an API that accepts URLs from the internet and redirects users
+to them. Let that sink in.
+
+    User submits: https://evil-phishing-site.com/fake-bank-login
+    Your API: "Sure! Here's a short URL: tinyscale.io/Ax7bK2"
+    Victim clicks Ax7bK2 -> redirected to phishing site
+    Your domain is now associated with a phishing attack.
+
+Or worse:
+
+    User submits: javascript:alert(document.cookie)
+    Your API stores it.
+    Someone clicks the link.
+    If your frontend renders it wrong -> XSS.
+
+Or even worse:
+
+    Attacker sends: { "url": "'; DROP TABLE urls; --" }
+    If you're building SQL strings manually -> your database is gone.
+
+Security isn't optional. It's not a "nice to have." It's the difference
+between a working API and a front-page Hacker News incident report.
+
+
+================================================================================
+STEP 5: HELMET.JS FOR HTTP SECURITY HEADERS
+================================================================================
+
+HTTP headers control browser behavior. Without security headers, browsers
+allow everything — which means attackers can exploit everything.
+
+>> WHAT HEADERS AND WHY? <<
+
+    Header                          What It Prevents
+    ------------------------------  ------------------------------------------
+    X-Content-Type-Options          Browser guessing file types (MIME sniffing)
+    X-Frame-Options                 Your site being embedded in an iframe (clickjacking)
+    Strict-Transport-Security       Downgrade attacks (HTTP instead of HTTPS)
+    X-XSS-Protection                Legacy XSS filter in old browsers
+    Content-Security-Policy         Loading scripts/styles from unauthorized sources
+    Referrer-Policy                 Leaking URLs to third parties via Referer header
+    X-Download-Options              Auto-opening downloaded files in IE
+    X-Permitted-Cross-Domain        Adobe Flash cross-domain access (yes, still needed)
+
+Setting these manually is tedious and error-prone. Helmet does it for you.
+
+Install helmet for Fastify:
+
+    npm install @fastify/helmet
+
+Now integrate it into your app:
+
+--- FILE: src/app.ts (add to your existing app factory) ---
+
+    import helmet from '@fastify/helmet';
+
+    // Inside your buildApp() function, after creating the Fastify instance:
+
+    // Security headers
+    await app.register(helmet, {
+        // Content Security Policy — controls what resources the browser can load
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],           // Only load resources from our domain
+                scriptSrc: ["'self'"],             // Only run scripts from our domain
+                styleSrc: ["'self'", "'unsafe-inline'"],  // Allow inline styles (for error pages)
+                imgSrc: ["'self'", "data:"],       // Allow images from our domain + data URIs
+                connectSrc: ["'self'"],            // Only allow fetch/XHR to our domain
+                fontSrc: ["'self'"],
+                objectSrc: ["'none'"],             // No Flash/Java applets
+                mediaSrc: ["'none'"],              // No audio/video from external sources
+                frameSrc: ["'none'"],              // Nobody can iframe our content
+            },
+        },
+        // HSTS — force HTTPS for 1 year
+        hsts: {
+            maxAge: 31536000,         // 1 year in seconds
+            includeSubDomains: true,  // Also apply to subdomains
+            preload: true,            // Allow browser preload lists
+        },
+    });
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. Content-Security-Policy (CSP) is the MOST IMPORTANT security header.
+   It tells the browser: "Only execute JavaScript from MY domain."
+   If an attacker injects a <script> tag pointing to evil.com, the browser
+   BLOCKS it because evil.com isn't in our scriptSrc list.
+
+2. HSTS (Strict-Transport-Security) tells the browser: "NEVER connect to
+   this domain over HTTP. Always use HTTPS." Even if the user types
+   http://tinyscale.io, the browser upgrades to HTTPS automatically.
+   This prevents man-in-the-middle attacks on the first connection.
+
+3. For a pure API (no frontend), CSP matters less. BUT if you ever add
+   a dashboard, error pages, or docs pages — it matters a LOT.
+
+4. `@fastify/helmet` is the Fastify-specific version. Don't use the
+   Express `helmet` package — it won't work with Fastify's plugin system.
+
+Verify the headers are set:
+
+    curl -I http://localhost:3000/api/health
+
+    # You should see:
+    # x-content-type-options: nosniff
+    # x-frame-options: SAMEORIGIN
+    # strict-transport-security: max-age=31536000; includeSubDomains; preload
+    # x-xss-protection: 0
+    # ... and more
+
+
+================================================================================
+STEP 6: CORS — WHAT IT ACTUALLY IS AND HOW TO CONFIGURE IT
+================================================================================
+
+>> WHAT IS CORS? <<
+
+CORS = Cross-Origin Resource Sharing.
+
+The "Same-Origin Policy" is a browser security rule:
+
+    JavaScript on https://frontend.com
+    CANNOT make requests to https://api.tinyscale.com
+    Because the ORIGINS are different.
+
+An "origin" is: protocol + domain + port.
+
+    https://frontend.com        ← Origin A
+    https://api.tinyscale.com   ← Origin B  (different domain = different origin)
+    http://frontend.com         ← Origin C  (different protocol = different origin!)
+    https://frontend.com:8080   ← Origin D  (different port = different origin!)
+
+Without CORS, a malicious website could:
+
+    1. User logs into your-bank.com (gets a session cookie)
+    2. User visits evil-site.com
+    3. evil-site.com's JavaScript makes requests to your-bank.com
+    4. The browser SENDS the cookies automatically
+    5. evil-site.com just transferred the user's money
+
+CORS prevents this. The browser asks the server: "Are you OK with
+requests from this origin?" The server responds with headers saying
+which origins are allowed.
+
+>> THE CORS DANCE (PREFLIGHT) <<
+
+When a browser makes a cross-origin request:
+
+    1. Browser sends an OPTIONS request (the "preflight"):
+       OPTIONS /api/urls
+       Origin: https://frontend.com
+       Access-Control-Request-Method: POST
+       Access-Control-Request-Headers: Content-Type, Authorization
+
+    2. Server responds with allowed origins/methods:
+       Access-Control-Allow-Origin: https://frontend.com
+       Access-Control-Allow-Methods: GET, POST, DELETE
+       Access-Control-Allow-Headers: Content-Type, Authorization
+       Access-Control-Max-Age: 86400
+
+    3. If allowed, browser sends the ACTUAL request:
+       POST /api/urls
+       Origin: https://frontend.com
+       Content-Type: application/json
+       Authorization: Bearer xxx
+
+    4. Server responds with data + CORS header:
+       Access-Control-Allow-Origin: https://frontend.com
+       {"shortUrl": "..."}
+
+IMPORTANT: CORS is a BROWSER-ONLY mechanism. Your Go CLI, curl, Postman —
+they all ignore CORS completely. CORS only restricts JavaScript running
+in a browser.
+
+Install the Fastify CORS plugin:
+
+    npm install @fastify/cors
+
+--- FILE: src/app.ts (add CORS configuration) ---
+
+    import cors from '@fastify/cors';
+
+    // Inside buildApp(), BEFORE registering routes:
+
+    await app.register(cors, {
+        // Which origins can access your API?
+        origin: [
+            'http://localhost:3000',              // Local development
+            'http://localhost:5173',              // Vite dev server (if you add a frontend)
+            'https://tinyscale.yourdomain.com',   // Production frontend
+        ],
+
+        // Which HTTP methods are allowed?
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+
+        // Which headers can the browser send?
+        allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Key'],
+
+        // Should the browser send cookies/auth on cross-origin requests?
+        credentials: true,
+
+        // How long (in seconds) can the browser cache the preflight response?
+        // 86400 = 24 hours. This avoids a preflight OPTIONS request on every API call.
+        maxAge: 86400,
+    });
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. NEVER use `origin: '*'` (allow all origins) if you have authentication.
+   With `credentials: true` and `origin: '*'`, the browser will refuse
+   to send cookies. More importantly, you're telling the browser: "Any
+   website on the internet can make authenticated requests to my API."
+
+2. For development, you'll often want to allow localhost. For production,
+   list ONLY your actual frontend domain(s).
+
+3. `maxAge: 86400` is a performance optimization. Without it, the browser
+   sends a preflight OPTIONS request BEFORE every real request. That's two
+   HTTP requests instead of one. The max-age tells the browser: "You already
+   asked, and the answer won't change for 24 hours."
+
+4. If you're building a pure API with no browser frontend (just CLI, mobile,
+   server-to-server), CORS doesn't matter. But add it anyway — you might
+   add a frontend later, and you'll wonder why it doesn't work.
+
+
+================================================================================
+STEP 7: SQL INJECTION PREVENTION
+================================================================================
+
+>> WHAT IS SQL INJECTION? <<
+
+SQL injection is when an attacker sends data that gets executed as SQL.
+
+Example of VULNERABLE code (DO NOT DO THIS):
+
+    // BAD BAD BAD — building SQL strings manually
+    const shortCode = request.params.code;
+    const result = await db.execute(
+        `SELECT * FROM urls WHERE short_code = '${shortCode}'`
+    );
+
+    // Attacker sends: code = "'; DROP TABLE urls; --"
+    // The query becomes:
+    // SELECT * FROM urls WHERE short_code = ''; DROP TABLE urls; --'
+    // Congratulations, your table is gone.
+
+>> ARE YOU VULNERABLE? <<
+
+Short answer: NO, and here's why.
+
+You're using Drizzle ORM, which uses parameterized queries:
+
+    // This is what Drizzle does internally:
+    // SELECT * FROM urls WHERE short_code = $1
+    // Parameters: ['Ax7bK2']
+    //
+    // The database treats $1 as DATA, never as SQL code.
+    // Even if the value is "'; DROP TABLE urls; --",
+    // it's treated as a literal string, not SQL.
+
+    const url = await db.query.urls.findFirst({
+        where: eq(urls.shortCode, shortCode),
+    });
+
+Drizzle (and every other ORM) parameterizes queries automatically.
+As long as you NEVER build SQL strings with template literals or
+string concatenation, you're safe.
+
+THE ONE EXCEPTION — Drizzle's sql`` template tag:
+
+    import { sql } from 'drizzle-orm';
+
+    // SAFE — uses parameterized queries:
+    const result = await db.execute(
+        sql`SELECT * FROM urls WHERE short_code = ${shortCode}`
+    );
+    // Drizzle converts this to: SELECT * FROM urls WHERE short_code = $1
+
+    // DANGEROUS — if you somehow bypass the tag:
+    const result = await db.execute(
+        sql.raw(`SELECT * FROM urls WHERE short_code = '${shortCode}'`)
+    );
+    // sql.raw() does NOT parameterize! Only use it for static SQL.
+
+RULE: Never use sql.raw() with user input. If you find yourself
+needing raw SQL, you're probably doing something wrong.
+
+
+================================================================================
+STEP 8: INPUT SANITIZATION + OPEN REDIRECT PREVENTION
+================================================================================
+
+>> WHAT IS AN OPEN REDIRECT ATTACK? <<
+
+An open redirect is when your application redirects users to a URL
+provided by an attacker. You're literally building a redirect service,
+so this is YOUR #1 security concern.
+
+The attack:
+
+    1. Attacker creates a short URL for: https://evil-phishing-bank.com
+    2. Sends email: "Your bank needs you to verify: https://tinyscale.io/Ax7bK2"
+    3. Victim sees tinyscale.io (looks legit) and clicks
+    4. Gets redirected to phishing site
+    5. Enters bank credentials
+    6. Attacker wins
+
+You CANNOT completely prevent this (URL shorteners are inherently redirectors),
+but you CAN:
+1. Block obviously dangerous URLs
+2. Block known malicious patterns
+3. Log and rate-limit URL creation
+
+>> URL VALIDATION CODE <<
+
+--- FILE: src/modules/url/url.validator.ts ---
+
+    import { URL } from 'node:url';
+
+    export interface ValidationResult {
+        valid: boolean;
+        reason?: string;
+        sanitizedUrl?: string;
+    }
+
+    // Protocols that are ALLOWED
+    const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
+
+    // Block these TLDs (known for abuse — this list should be updated)
+    const BLOCKED_TLDS = new Set([
+        // Add TLDs you want to block based on your threat model
+    ]);
+
+    // Block private/internal IP ranges
+    const PRIVATE_IP_PATTERNS = [
+        /^127\./,                          // Loopback
+        /^10\./,                           // Private class A
+        /^172\.(1[6-9]|2\d|3[01])\./,     // Private class B
+        /^192\.168\./,                     // Private class C
+        /^169\.254\./,                     // Link-local
+        /^0\./,                            // "This" network
+        /^fc00:/i,                         // IPv6 unique local
+        /^fe80:/i,                         // IPv6 link-local
+        /^::1$/,                           // IPv6 loopback
+    ];
+
+    export function validateUrl(input: string): ValidationResult {
+        // Step 1: Basic string validation
+        if (!input || typeof input !== 'string') {
+            return { valid: false, reason: 'URL is required' };
+        }
+
+        // Remove leading/trailing whitespace
+        const trimmed = input.trim();
+
+        // Step 2: Length check (prevent abuse)
+        if (trimmed.length > 2048) {
+            return { valid: false, reason: 'URL exceeds maximum length of 2048 characters' };
+        }
+
+        // Step 3: Parse the URL
+        let parsed: URL;
+        try {
+            parsed = new URL(trimmed);
+        } catch {
+            return { valid: false, reason: 'Invalid URL format' };
+        }
+
+        // Step 4: Protocol check — CRITICAL
+        // Block javascript:, data:, file:, ftp:, etc.
+        if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+            return {
+                valid: false,
+                reason: `Protocol "${parsed.protocol}" is not allowed. Use http: or https:`,
+            };
+        }
+
+        // Step 5: Block localhost and private IPs (SSRF prevention)
+        const hostname = parsed.hostname.toLowerCase();
+
+        if (hostname === 'localhost' || hostname === '') {
+            return { valid: false, reason: 'localhost URLs are not allowed' };
+        }
+
+        // Check against private IP ranges
+        for (const pattern of PRIVATE_IP_PATTERNS) {
+            if (pattern.test(hostname)) {
+                return {
+                    valid: false,
+                    reason: 'Private/internal IP addresses are not allowed',
+                };
+            }
+        }
+
+        // Step 6: Block URLs that try to trick with userinfo
+        // Example: https://google.com@evil.com (redirects to evil.com, not google.com)
+        if (parsed.username || parsed.password) {
+            return {
+                valid: false,
+                reason: 'URLs with username/password are not allowed',
+            };
+        }
+
+        // Step 7: Check for blocked TLDs
+        const tld = hostname.split('.').pop() || '';
+        if (BLOCKED_TLDS.has(tld)) {
+            return { valid: false, reason: `TLD ".${tld}" is not allowed` };
+        }
+
+        // Step 8: Return the sanitized URL
+        // Use the parsed URL's href — this normalizes the URL
+        return {
+            valid: true,
+            sanitizedUrl: parsed.href,
+        };
+    }
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `javascript:` protocol is the BIGGEST threat. If someone submits
+   `javascript:alert(document.cookie)` and you redirect to it, you've
+   created an XSS vulnerability. By only allowing http: and https:,
+   you eliminate this entire attack class.
+
+2. SSRF (Server-Side Request Forgery): If your app fetches the URL
+   (for preview, screenshot, etc.), an attacker could submit
+   `http://169.254.169.254/latest/meta-data/` (AWS metadata endpoint)
+   and steal your cloud credentials. Blocking private IPs prevents this.
+   Even if you don't fetch URLs NOW, block private IPs — you might add
+   preview functionality later.
+
+3. The `userinfo` trick: `https://google.com@evil.com` looks like it
+   goes to google.com. It actually goes to evil.com with the username
+   "google.com". This is how phishing URLs work.
+
+4. URL normalization: `new URL(input).href` normalizes the URL. It:
+   - Lowercases the protocol and hostname
+   - Resolves relative paths (/../../../etc/passwd)
+   - Encodes special characters
+   - Removes redundant port numbers (80 for http, 443 for https)
+
+Now USE this validator in your URL creation route:
+
+--- FILE: src/modules/url/url.routes.ts (update your POST handler) ---
+
+    import { validateUrl } from './url.validator.js';
+
+    // Inside your POST /api/urls handler:
+    async function createUrl(request: FastifyRequest, reply: FastifyReply) {
+        const { url } = request.body as { url: string };
+
+        // Validate and sanitize the URL BEFORE storing it
+        const validation = validateUrl(url);
+        if (!validation.valid) {
+            return reply.status(400).send({
+                error: 'Invalid URL',
+                message: validation.reason,
+            });
+        }
+
+        // Use the sanitized URL, NOT the raw input
+        const sanitizedUrl = validation.sanitizedUrl!;
+
+        // ... rest of your URL creation logic, using sanitizedUrl
+    }
+
+--- END OF FILE ---
+
+
+================================================================================
+STEP 9: npm audit AND VULNERABILITY SCANNING
+================================================================================
+
+>> WHY? <<
+
+Your node_modules/ contains thousands of packages, written by thousands
+of different people. Any one of them could have a security vulnerability.
+
+In 2021, the `ua-parser-js` package (78M weekly downloads) was compromised.
+For 4 hours, anyone who ran `npm install` got malware. This is real.
+
+>> npm audit <<
+
+    # Check for known vulnerabilities
+    npm audit
+
+    # Output looks like:
+    # found 3 vulnerabilities (1 low, 1 moderate, 1 high)
+    #
+    # ┌─────────────────────────────┐
+    # │ high │ Prototype Pollution   │
+    # ├─────────────────────────────┤
+    # │ Package  │ lodash            │
+    # │ Version  │ 4.17.20           │
+    # │ Fix      │ npm audit fix     │
+    # └─────────────────────────────┘
+
+    # Auto-fix what can be fixed without breaking changes
+    npm audit fix
+
+    # Force fix (may break things — test after!)
+    npm audit fix --force
+
+    # Generate a detailed JSON report (useful for CI)
+    npm audit --json > audit-report.json
+
+IMPORTANT: Add npm audit to your CI pipeline! Add this step to ci.yml:
+
+    - name: Security audit
+      run: npm audit --audit-level=high
+      # --audit-level=high means: only fail on high/critical vulnerabilities
+      # You can change to "moderate" for stricter checking
+
+>> Docker Image Scanning <<
+
+Your Docker images can also have vulnerabilities — in the OS packages,
+in the base image, etc.
+
+    # Scan your Docker image (requires Docker Scout or Trivy)
+    # Option 1: Docker Scout (built into Docker Desktop)
+    docker scout cves tinyscale:latest
+
+    # Option 2: Trivy (free, open source, widely used)
+    # Install: https://aquasecurity.github.io/trivy
+    trivy image tinyscale:latest
+
+    # Output:
+    # tinyscale:latest (debian 12.4)
+    # ═══════════════════════════════
+    # Total: 42 (UNKNOWN: 0, LOW: 28, MEDIUM: 12, HIGH: 2, CRITICAL: 0)
+    #
+    # ┌──────────────┬──────────┬──────────┬─────────────────────────────┐
+    # │   Library    │ Severity │ Version  │       Fixed Version         │
+    # ├──────────────┼──────────┼──────────┼─────────────────────────────┤
+    # │ openssl      │   HIGH   │ 3.0.11   │       3.0.13               │
+    # │ curl         │   HIGH   │ 7.88.1   │       7.88.1-10+deb12u5    │
+    # └──────────────┴──────────┴──────────┴─────────────────────────────┘
+
+HOW TO REDUCE DOCKER VULNERABILITIES:
+
+1. Use Alpine-based images (fewer packages = fewer vulnerabilities):
+   FROM node:20-alpine    # Instead of node:20 (Debian-based)
+
+2. Use multi-stage builds (your final image has NO build tools):
+
+    # Build stage
+    FROM node:20-alpine AS builder
+    WORKDIR /app
+    COPY package*.json ./
+    RUN npm ci
+    COPY . .
+    RUN npm run build
+
+    # Production stage
+    FROM node:20-alpine
+    WORKDIR /app
+    COPY --from=builder /app/dist ./dist
+    COPY --from=builder /app/node_modules ./node_modules
+    COPY package*.json ./
+    USER node                  # Don't run as root!
+    EXPOSE 3000
+    CMD ["node", "dist/server.js"]
+
+3. The `USER node` line is CRITICAL. By default, Docker runs as root.
+   If an attacker exploits your app, they get root access to the container.
+   Running as `node` limits the damage.
+
+You can add Trivy scanning to your CI:
+
+    # Add to docker-publish.yml, before the push step:
+    - name: Scan Docker image for vulnerabilities
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        format: 'table'
+        exit-code: '1'              # Fail the build on vulnerabilities
+        severity: 'CRITICAL,HIGH'   # Only fail on critical/high
+
+
+================================================================================
+STEP 10: OWASP TOP 10 — WITH TINYSCALE-SPECIFIC EXAMPLES
+================================================================================
+
+The OWASP Top 10 is the industry-standard list of the most critical web
+application security risks. Updated every few years. Here's the 2021
+version with how each applies to YOUR project:
+
+    #   Risk                        Your Exposure   What You Did
+    --  -------------------------   -------------   ---------------------------
+    A01 Broken Access Control        HIGH           JWT + API key auth, but
+                                                    verify: can user A see
+                                                    user B's URLs?
+
+    A02 Cryptographic Failures       MEDIUM         API keys must be hashed
+                                                    (bcrypt/argon2), not stored
+                                                    in plain text. JWTs signed
+                                                    with strong secret.
+
+    A03 Injection                    LOW            Drizzle ORM parameterizes
+                                                    queries. But check any
+                                                    raw SQL you might use.
+
+    A04 Insecure Design              MEDIUM         Open redirect is a DESIGN
+                                                    issue. URL validation
+                                                    mitigates but can't fully
+                                                    prevent.
+
+    A05 Security Misconfiguration    HIGH           Default passwords, debug
+                                                    mode in production, Helmet
+                                                    headers, CORS. Check ALL.
+
+    A06 Vulnerable Components        MEDIUM         npm audit, Docker scan.
+                                                    Keep dependencies updated.
+
+    A07 Auth Failures                MEDIUM         Brute force login, weak
+                                                    JWT secrets. Rate limiting
+                                                    helps. Use strong secrets.
+
+    A08 Data Integrity Failures      LOW            Verify your npm packages
+                                                    (lockfile). Use signed
+                                                    Docker images.
+
+    A09 Logging Failures             MEDIUM         Are you logging auth
+                                                    failures? Can you detect
+                                                    an ongoing attack?
+
+    A10 SSRF                         HIGH           Your URL shortener ACCEPTS
+                                                    URLs. Block private IPs
+                                                    (Step 8 above).
+
+MOST CRITICAL FOR TINYSCALE:
+
+1. A01 (Broken Access Control): Make sure your endpoints check ownership.
+   User A should NOT be able to delete User B's short URLs. Check this
+   in every route handler:
+
+    // WRONG — any authenticated user can delete any URL:
+    app.delete('/api/urls/:id', async (request, reply) => {
+        const { id } = request.params;
+        await db.delete(urls).where(eq(urls.id, id));   // No ownership check!
+    });
+
+    // RIGHT — verify the URL belongs to the requesting user:
+    app.delete('/api/urls/:id', async (request, reply) => {
+        const { id } = request.params;
+        const userId = request.user.id;
+        const result = await db.delete(urls).where(
+            and(eq(urls.id, id), eq(urls.userId, userId))  // Ownership check!
+        );
+        if (result.rowCount === 0) {
+            return reply.status(404).send({ error: 'URL not found' });
+        }
+    });
+
+2. A05 (Security Misconfiguration): Check these RIGHT NOW:
+   - Is your JWT_SECRET a strong random string? (Not "secret" or "password")
+   - Is your Postgres password "dev" in production? (It should NOT be)
+   - Is debug logging turned off in production?
+   - Are your Docker containers running as non-root?
+   - Is your Redis instance password-protected?
+
+3. A10 (SSRF): Already covered in Step 8. Your URL validator blocks
+   private IPs. But also consider: if you ever add URL preview/screenshot
+   functionality, that's a MAJOR SSRF vector. The server would fetch
+   arbitrary URLs on behalf of users.
+
+
+================================================================================
+DAY 5-6: DATABASE OPERATIONS
+================================================================================
+
+BEFORE YOU TOUCH YOUR DATABASE IN PRODUCTION - READ AND UNDERSTAND THIS:
+-------------------------------------------------------------------------
+
+>> WHY MIGRATIONS? <<
+
+Right now, when you change your database schema, you probably do this:
+
+    1. Edit schema in Drizzle
+    2. Run `drizzle-kit push` (syncs schema directly to the database)
+    3. It works on your local database
+    4. Deploy to production
+    5. Run `drizzle-kit push` on production
+    6. Hope nothing breaks
+
+This is fine for development. It's TERRIFYING for production.
+
+What `drizzle-kit push` does: It looks at your schema, looks at the
+database, and generates ALTER TABLE statements to sync them. It does
+this LIVE. There's no record of what changed. There's no way to undo it.
+
+What MIGRATIONS do: They create a VERSIONED, SEQUENTIAL set of SQL files:
+
+    migrations/
+    |-- 0001_initial_schema.sql
+    |-- 0002_add_clicks_table.sql
+    |-- 0003_add_api_keys_table.sql
+    |-- 0004_add_expires_at_column.sql
+
+Each file contains the exact SQL that transforms the database from
+version N to version N+1. The database tracks which migrations have run.
+You can see the history. You can roll back. You can reproduce the exact
+same schema on any machine.
+
+>> THE CRITICAL DIFFERENCE <<
+
+    drizzle-kit push              Migrations
+    ----------------------        --------------------------
+    "Just make it match"          "Here's exactly what changed"
+    No history                    Full version history
+    Can't undo                    Can roll back
+    Dangerous in production       Safe in production
+    Good for development          Required for production
+
+ANALOGY: `drizzle-kit push` is like editing a Google Doc directly.
+Migrations are like using Git — every change is a commit, you can
+see history, you can revert.
+
+
+================================================================================
+STEP 11: DRIZZLE MIGRATION WORKFLOW
+================================================================================
+
+>> GENERATE MIGRATIONS <<
+
+    # Generate a migration from your current schema changes
+    npx drizzle-kit generate
+
+    # This creates a file like:
+    # drizzle/0001_amazing_exodus.sql (Drizzle generates fun names)
+
+    # The file contains the raw SQL:
+    # CREATE TABLE IF NOT EXISTS "urls" (
+    #   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    #   "short_code" varchar(10) NOT NULL UNIQUE,
+    #   "original_url" text NOT NULL,
+    #   ...
+    # );
+
+>> APPLY MIGRATIONS <<
+
+    # Run all pending migrations
+    npx drizzle-kit migrate
+
+    # This:
+    # 1. Checks which migrations have already been applied
+    # 2. Runs only the new ones, in order
+    # 3. Records that they've been applied in a __drizzle_migrations table
+
+>> THE WORKFLOW <<
+
+When you make a schema change:
+
+    1. Edit your schema file (src/db/schema/tables.ts)
+
+    2. Generate a migration:
+       npx drizzle-kit generate
+
+    3. REVIEW the generated SQL file! Don't blindly apply it.
+       Open the file in drizzle/ and read every line.
+
+    4. Test locally:
+       npx drizzle-kit migrate
+
+    5. Commit the migration file to Git:
+       git add drizzle/
+       git commit -m "migration: add expires_at column to urls table"
+
+    6. In CI/CD, migrations run automatically before the app starts.
+
+>> YOUR drizzle.config.ts SHOULD LOOK LIKE THIS <<
+
+--- FILE: drizzle.config.ts ---
+
+    import { defineConfig } from 'drizzle-kit';
+
+    export default defineConfig({
+        schema: './src/db/schema/tables.ts',
+        out: './drizzle',                       // Migration output directory
+        dialect: 'postgresql',
+        dbCredentials: {
+            url: process.env.DATABASE_URL || 'postgres://dev:dev@localhost:5432/tinyscale',
+        },
+        verbose: true,                          // Show SQL in console
+        strict: true,                           // Fail on ambiguous changes
+    });
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `strict: true` is important. Without it, Drizzle might guess what
+   you mean when you rename a column. With strict mode, it asks you
+   explicitly: "Did you rename 'shortCode' to 'short_code', or did you
+   delete 'shortCode' and create 'short_code'?" These are VERY different
+   operations (rename preserves data, delete+create loses data).
+
+2. NEVER manually edit a migration file that has already been applied to
+   a database. Once a migration has run, it's immutable. If you need to
+   change something, create a NEW migration.
+
+3. In production, your deployment script should be:
+       npx drizzle-kit migrate    # Run pending migrations
+       node dist/server.js        # Start the app
+
+   Migrations run BEFORE the app starts. If a migration fails, the app
+   doesn't start. This is intentional.
+
+>> WHY NOT JUST ALTER TABLE IN PRODUCTION? <<
+
+    ssh production-server
+    psql tinyscale
+    ALTER TABLE urls ADD COLUMN expires_at TIMESTAMP;
+
+This "works" but:
+1. No record of the change. Was it you? Your coworker? When?
+2. Your schema file is now OUT OF SYNC with the actual database.
+3. When you deploy next, `drizzle-kit push` sees the column and
+   gets confused. Or worse, it tries to create it again and fails.
+4. If you have multiple environments (staging, production), you have
+   to remember to run the same ALTER TABLE on each. You WILL forget.
+5. You can't reproduce the database. If you need to set up a new
+   environment, you don't know what manual changes were made.
+
+Migrations solve ALL of these problems.
+
+
+================================================================================
+STEP 12: BACKUP SCRIPT FOR POSTGRES (pg_dump)
+================================================================================
+
+>> WHY BACKUPS? <<
+
+    Scenario 1: You run a bad migration that drops a column with 2 million rows.
+    Scenario 2: Your Kubernetes node's disk fails.
+    Scenario 3: A disgruntled employee runs DELETE FROM urls.
+    Scenario 4: You get hacked and the attacker encrypts your data (ransomware).
+
+Without backups, all of these = total data loss. With backups, all of
+these = "restore from last night's backup, lose a few hours of data."
+
+>> pg_dump — THE POSTGRES BACKUP TOOL <<
+
+`pg_dump` creates a snapshot of your database. It produces SQL that can
+recreate the entire database from scratch.
+
+--- FILE: scripts/backup.sh ---
+
+    #!/bin/bash
+    #
+    # TinyScale Database Backup Script
+    #
+    # Usage: ./scripts/backup.sh
+    # Cron:  0 2 * * * /path/to/scripts/backup.sh
+    #        (Runs at 2 AM every day)
+    #
+
+    set -euo pipefail
+    # -e: Exit on error
+    # -u: Exit on undefined variable
+    # -o pipefail: Exit if any command in a pipe fails
+
+    # ============================================================
+    # Configuration
+    # ============================================================
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_NAME="${DB_NAME:-tinyscale}"
+    DB_USER="${DB_USER:-dev}"
+    BACKUP_DIR="${BACKUP_DIR:-./backups}"
+    RETENTION_DAYS="${RETENTION_DAYS:-30}"   # Keep backups for 30 days
+
+    # Timestamp for the backup file
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    BACKUP_FILE="${BACKUP_DIR}/${DB_NAME}_${TIMESTAMP}.sql.gz"
+
+    # ============================================================
+    # Create backup directory if it doesn't exist
+    # ============================================================
+    mkdir -p "$BACKUP_DIR"
+
+    # ============================================================
+    # Create the backup
+    # ============================================================
+    echo "[$(date)] Starting backup of database: $DB_NAME"
+
+    # pg_dump options:
+    #   -h: host
+    #   -p: port
+    #   -U: username
+    #   -d: database name
+    #   --no-owner: Don't include ownership commands (portable across environments)
+    #   --no-privileges: Don't include GRANT/REVOKE (portable)
+    #   -F c: Custom format (compressed, supports selective restore)
+    #
+    # We pipe through gzip for additional compression.
+
+    PGPASSWORD="${DB_PASSWORD:-dev}" pg_dump \
+        -h "$DB_HOST" \
+        -p "$DB_PORT" \
+        -U "$DB_USER" \
+        -d "$DB_NAME" \
+        --no-owner \
+        --no-privileges \
+        --verbose \
+        2>"${BACKUP_DIR}/backup_${TIMESTAMP}.log" \
+        | gzip > "$BACKUP_FILE"
+
+    # Check if backup was created successfully
+    if [ -f "$BACKUP_FILE" ] && [ -s "$BACKUP_FILE" ]; then
+        FILESIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+        echo "[$(date)] Backup completed: $BACKUP_FILE ($FILESIZE)"
+    else
+        echo "[$(date)] ERROR: Backup failed!" >&2
+        exit 1
+    fi
+
+    # ============================================================
+    # Clean up old backups (older than RETENTION_DAYS)
+    # ============================================================
+    echo "[$(date)] Cleaning up backups older than $RETENTION_DAYS days..."
+
+    find "$BACKUP_DIR" -name "${DB_NAME}_*.sql.gz" -mtime +${RETENTION_DAYS} -delete
+    find "$BACKUP_DIR" -name "backup_*.log" -mtime +${RETENTION_DAYS} -delete
+
+    REMAINING=$(find "$BACKUP_DIR" -name "${DB_NAME}_*.sql.gz" | wc -l)
+    echo "[$(date)] Cleanup complete. $REMAINING backups remaining."
+
+    echo "[$(date)] Backup process finished successfully."
+
+--- END OF FILE ---
+
+Make it executable:
+
+    chmod +x scripts/backup.sh
+
+Run it:
+
+    # Set the password via environment variable
+    DB_PASSWORD=dev ./scripts/backup.sh
+
+    # Output:
+    # [2024-01-15 02:00:01] Starting backup of database: tinyscale
+    # [2024-01-15 02:00:03] Backup completed: ./backups/tinyscale_20240115_020001.sql.gz (2.1M)
+    # [2024-01-15 02:00:03] Cleaning up backups older than 30 days...
+    # [2024-01-15 02:00:03] Cleanup complete. 15 backups remaining.
+    # [2024-01-15 02:00:03] Backup process finished successfully.
+
+THINGS TO UNDERSTAND:
+
+1. `set -euo pipefail` — The holy trinity of bash safety:
+   - `-e`: Stop immediately if any command fails (don't continue with corrupted state)
+   - `-u`: Treat undefined variables as errors (catches typos like $DB_NAEM)
+   - `-o pipefail`: If `pg_dump` fails but `gzip` succeeds, the script still fails.
+     Without this, bash only checks the exit code of the LAST command in a pipe.
+
+2. `PGPASSWORD` environment variable — pg_dump doesn't have a --password flag.
+   It reads the password from PGPASSWORD or a .pgpass file. NEVER put passwords
+   in the script itself. Pass them via environment variables.
+
+3. `--no-owner --no-privileges` — Makes the backup portable. Without these,
+   the backup includes "ALTER TABLE urls OWNER TO dev", which fails if
+   the target database has a different username.
+
+4. The gzip compression ratio for SQL is typically 10:1 to 20:1.
+   A 200MB database becomes a 10-20MB backup file.
+
+5. `RETENTION_DAYS=30` — Keep 30 days of backups. This is a balance between
+   disk space and "oh crap, we need to restore from two weeks ago."
+   Adjust based on your data importance and disk budget.
+
+6. The `find ... -mtime +30 -delete` command deletes files older than 30 days.
+   This prevents your backup directory from growing forever.
+
+>> AUTOMATING WITH CRON (Linux/Docker) <<
+
+    # Edit crontab
+    crontab -e
+
+    # Add this line (runs at 2 AM every day):
+    0 2 * * * /home/deploy/tinyscale/scripts/backup.sh >> /var/log/tinyscale-backup.log 2>&1
+
+    # The >> appends to a log file so you can audit backup history.
+
+If running in Docker/Kubernetes, you'd use a CronJob (you learned this in Week 6).
+
+
+================================================================================
+STEP 13: RESTORE FROM BACKUP
+================================================================================
+
+A backup you can't restore from is NOT a backup. It's a waste of disk space.
+
+>> FULL RESTORE STEPS <<
+
+    # Step 1: Decompress the backup
+    gunzip -k ./backups/tinyscale_20240115_020001.sql.gz
+    # -k keeps the original .gz file (don't delete your backup!)
+
+    # Step 2: Create a fresh database (or use the existing one)
+    # WARNING: This drops ALL data in the target database!
+    PGPASSWORD=dev psql -h localhost -U dev -d postgres -c "
+        DROP DATABASE IF EXISTS tinyscale_restored;
+        CREATE DATABASE tinyscale_restored;
+    "
+
+    # Step 3: Restore the backup into the new database
+    PGPASSWORD=dev psql -h localhost -U dev -d tinyscale_restored \
+        < ./backups/tinyscale_20240115_020001.sql
+
+    # Step 4: Verify the restore
+    PGPASSWORD=dev psql -h localhost -U dev -d tinyscale_restored -c "
+        SELECT COUNT(*) as url_count FROM urls;
+        SELECT COUNT(*) as click_count FROM clicks;
+        SELECT COUNT(*) as user_count FROM users;
+    "
+
+    # Step 5: If everything looks good, swap the databases
+    PGPASSWORD=dev psql -h localhost -U dev -d postgres -c "
+        -- Disconnect all users from the old database
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = 'tinyscale' AND pid <> pg_backend_pid();
+
+        -- Rename old database (keep it as a safety net)
+        ALTER DATABASE tinyscale RENAME TO tinyscale_old;
+
+        -- Rename restored database to production name
+        ALTER DATABASE tinyscale_restored RENAME TO tinyscale;
+    "
+
+    # Step 6: Restart your application (it reconnects to 'tinyscale')
+    # In Docker: docker compose restart app
+    # In K8s: kubectl rollout restart deployment/tinyscale-app
+
+THINGS TO UNDERSTAND:
+
+1. ALWAYS restore to a DIFFERENT database name first. Verify it works.
+   THEN swap. Never restore directly into your production database.
+
+2. `pg_terminate_backend` disconnects active connections. You can't rename
+   a database while someone is connected to it. This causes a brief
+   outage (a few seconds).
+
+3. We keep the old database as `tinyscale_old` for safety. Once you've
+   verified the restored database works, drop it:
+       DROP DATABASE tinyscale_old;
+
+4. TEST YOUR RESTORE PROCESS. Seriously. Right now. Run the backup script,
+   then restore it. If you've never tested a restore, you don't have backups.
+   You have hopes and prayers.
+
+>> POINT-IN-TIME RECOVERY (PITR) — THE NEXT LEVEL <<
+
+pg_dump gives you a snapshot — the database at the moment you ran the backup.
+If your backup runs at 2 AM and the database crashes at 1 PM, you lose
+11 hours of data.
+
+PITR uses Postgres's WAL (Write-Ahead Log) to restore to ANY point in time:
+"Give me the database as it was at 12:47 PM on Tuesday."
+
+This is a production-grade feature. You'd configure:
+1. WAL archiving (Postgres writes every change to log files)
+2. A base backup (like pg_dump, but at the file system level)
+3. Recovery to a specific timestamp
+
+For TinyScale, pg_dump is sufficient. PITR is what you'd use at a company
+managing critical data. Know that it exists.
+
+
+================================================================================
+STEP 14: CONNECTION POOLING WITH PGBOUNCER
+================================================================================
+
+>> THE PROBLEM <<
+
+Every time your application connects to Postgres, this happens:
+
+    App                         Postgres
+     |                            |
+     |-- TCP handshake --------->|  (network round trip)
+     |<-- TCP ACK ---------------|
+     |-- SSL handshake --------->|  (if using SSL)
+     |<-- SSL ACK ---------------|
+     |-- Auth request ---------->|  (username + password)
+     |<-- Auth OK ---------------|
+     |-- Connection ready ------>|  (allocate memory for this connection)
+
+Each connection costs:
+- ~10ms of latency (for the handshake dance)
+- ~5-10MB of memory ON THE POSTGRES SERVER
+- A process slot (Postgres forks a process per connection)
+
+Postgres has a `max_connections` setting (default: 100).
+
+Now think about what happens at scale:
+
+    1 Node.js instance with Drizzle's default pool (10 connections) = 10 connections
+    5 Node.js instances (Kubernetes replicas) = 50 connections
+    Add your backup script = 51
+    Add your monitoring queries = 52
+    Add your migration runner = 53
+    Add a developer querying with psql = 54
+
+    That's 54 connections from just YOUR app. What about:
+    - A staging environment (another 50)
+    - A data analytics tool (20 connections)
+    - A cron job service (10 connections)
+
+    Total: 134 connections. You've exceeded max_connections (100).
+    New connections are REFUSED. Your app crashes.
+
+>> THE SOLUTION: CONNECTION POOLING <<
+
+PgBouncer sits BETWEEN your app and Postgres:
+
+    Without PgBouncer:
+    ┌──────────┐     ┌──────────┐
+    │ App 1    │──10──│          │
+    │ App 2    │──10──│ Postgres │  50 connections
+    │ App 3    │──10──│          │  (each costs memory + process)
+    │ App 4    │──10──│          │
+    │ App 5    │──10──│          │
+    └──────────┘     └──────────┘
+
+    With PgBouncer:
+    ┌──────────┐     ┌───────────┐     ┌──────────┐
+    │ App 1    │──10──│           │     │          │
+    │ App 2    │──10──│ PgBouncer │──5──│ Postgres │  5 actual connections!
+    │ App 3    │──10──│           │     │          │
+    │ App 4    │──10──│ (pool)    │     │          │
+    │ App 5    │──10──│           │     │          │
+    └──────────┘     └───────────┘     └──────────┘
+
+    50 app connections -> 5 actual Postgres connections.
+    PgBouncer REUSES connections. When App 1 finishes a query,
+    that connection is returned to the pool and given to App 3.
+
+>> POOL MODES <<
+
+PgBouncer has three modes:
+
+    Mode            How It Works                     Pros/Cons
+    -----------     ----------------------------     --------------------------
+    session         1 app connection = 1 PG conn     Safe but defeats the purpose
+                    for the entire session           (same as no pooling)
+
+    transaction     Conn returned to pool after      Best for most apps.
+                    each transaction completes       Can't use session-level
+                                                     features (LISTEN/NOTIFY,
+                                                     prepared statements*)
+
+    statement       Conn returned after each         Most aggressive pooling.
+                    single statement                 Breaks multi-statement
+                                                     transactions. Rarely used.
+
+*Note: PgBouncer supports prepared statements in newer versions (1.21+).
+
+For TinyScale, use TRANSACTION mode. Your queries are simple
+(SELECT, INSERT, UPDATE) and don't use session-level features.
+
+
+================================================================================
+STEP 15: PGBOUNCER DOCKER SETUP
+================================================================================
+
+Add PgBouncer to your docker-compose.yml:
+
+--- FILE: docker-compose.yml (add this service) ---
+
+    pgbouncer:
+      image: edoburu/pgbouncer:1.22.0
+      container_name: tinyscale-pgbouncer
+      environment:
+        DATABASE_URL: postgres://dev:dev@postgres:5432/tinyscale
+        POOL_MODE: transaction
+        DEFAULT_POOL_SIZE: 20        # Max 20 actual Postgres connections
+        MAX_CLIENT_CONN: 200         # Accept up to 200 app connections
+        MIN_POOL_SIZE: 5             # Always keep 5 connections warm
+        RESERVE_POOL_SIZE: 5         # Extra connections for burst traffic
+        RESERVE_POOL_TIMEOUT: 3      # Wait 3s before using reserve pool
+        SERVER_IDLE_TIMEOUT: 300     # Close idle server connections after 5 min
+        LOG_CONNECTIONS: 1
+        LOG_DISCONNECTIONS: 1
+        AUTH_TYPE: plain             # For development. Use scram-sha-256 in prod.
+      ports:
+        - "6432:6432"                # PgBouncer default port
+      depends_on:
+        postgres:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -h localhost -p 6432"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+      networks:
+        - tinyscale-network
+
+--- END OF FILE ---
+
+Now update your application to connect through PgBouncer:
+
+--- FILE: .env (or environment variables) ---
+
+    # BEFORE (direct to Postgres):
+    # DATABASE_URL=postgres://dev:dev@postgres:5432/tinyscale
+
+    # AFTER (through PgBouncer):
+    DATABASE_URL=postgres://dev:dev@pgbouncer:6432/tinyscale
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. Port 6432 is PgBouncer's default port. Your app connects to PgBouncer
+   on 6432, and PgBouncer connects to Postgres on 5432. Your app code
+   doesn't change AT ALL — just the connection string.
+
+2. `DEFAULT_POOL_SIZE: 20` means PgBouncer opens at most 20 connections
+   to Postgres. Even if 200 app connections are active, only 20 are
+   actually hitting Postgres. The other 180 are queued inside PgBouncer.
+
+3. `MAX_CLIENT_CONN: 200` means PgBouncer accepts up to 200 connections
+   from your applications. Beyond 200, new connections are refused.
+
+4. `MIN_POOL_SIZE: 5` keeps 5 connections always open. Without this,
+   PgBouncer would close idle connections, and the first request after
+   idle time would pay the connection setup cost.
+
+5. `RESERVE_POOL_SIZE: 5` is for burst handling. If all 20 pool
+   connections are busy and traffic spikes, PgBouncer can open 5 more
+   (total 25) temporarily. The `RESERVE_POOL_TIMEOUT: 3` means it
+   waits 3 seconds before dipping into the reserve pool.
+
+6. `AUTH_TYPE: plain` is fine for development (Docker network is isolated).
+   In production, use `scram-sha-256` for password hashing.
+
+>> VERIFY PGBOUNCER IS WORKING <<
+
+    # Connect to PgBouncer's admin console
+    PGPASSWORD=dev psql -h localhost -p 6432 -U dev pgbouncer -c "SHOW POOLS;"
+
+    # Output:
+    #  database  |  user  | cl_active | cl_waiting | sv_active | sv_idle
+    # -----------+--------+-----------+------------+-----------+--------
+    #  tinyscale |  dev   |     3     |     0      |     2     |    3
+    #
+    # cl_active  = app connections currently running a query
+    # cl_waiting = app connections waiting for a pool slot
+    # sv_active  = Postgres connections currently in use
+    # sv_idle    = Postgres connections idle in the pool
+
+    # Check stats
+    PGPASSWORD=dev psql -h localhost -p 6432 -U dev pgbouncer -c "SHOW STATS;"
+
+    # You can also monitor PgBouncer with Prometheus:
+    # Use pgbouncer_exporter to expose metrics to your Grafana dashboard.
+
+
+================================================================================
+DAY 7: DOCUMENTATION
+================================================================================
+
+>> WHY DOCUMENT? <<
+
+You've built a complex system. It has:
+- A TypeScript API with auth, caching, and event streaming
+- Redis, Postgres, Kafka, PgBouncer
+- Docker Compose and Kubernetes manifests
+- A Go CLI tool
+- Prometheus + Grafana monitoring
+- CI/CD pipelines
+
+If you step away for 2 weeks and come back, you'll forget how to:
+- Start the dev environment
+- Run the tests
+- Deploy to Kubernetes
+- Restore from a backup
+
+If someone else wants to contribute, they'll be completely lost.
+
+Documentation is not about being thorough. It's about being FINDABLE.
+Write the minimum that lets someone (including future you) get from zero
+to productive in 15 minutes.
+
+
+================================================================================
+STEP 16: API DOCUMENTATION WITH CURL EXAMPLES
+================================================================================
+
+Every API endpoint should be documented with:
+1. What it does
+2. What you send
+3. What you get back
+4. Example curl command that WORKS (copy-paste ready)
+
+--- EXAMPLE: API DOCUMENTATION ---
+
+    =========================================================
+    TINYSCALE API REFERENCE
+    =========================================================
+
+    Base URL: http://localhost:3000 (development)
+              https://tinyscale.yourdomain.com (production)
+
+    Authentication:
+      - JWT Bearer token: Authorization: Bearer <token>
+      - API Key: X-Api-Key: <key>
+
+    ---------------------------------------------------------
+    POST /api/auth/register
+    ---------------------------------------------------------
+    Create a new user account.
+
+    Request:
+        curl -X POST http://localhost:3000/api/auth/register \
+          -H "Content-Type: application/json" \
+          -d '{"email": "user@example.com", "password": "securePassword123"}'
+
+    Response (201):
+        {
+          "id": "550e8400-e29b-41d4-a716-446655440000",
+          "email": "user@example.com",
+          "createdAt": "2024-01-15T10:30:00.000Z"
+        }
+
+    Errors:
+        409 — Email already registered
+        400 — Invalid email or password too short
+
+    ---------------------------------------------------------
+    POST /api/auth/login
+    ---------------------------------------------------------
+    Get a JWT token.
+
+    Request:
+        curl -X POST http://localhost:3000/api/auth/login \
+          -H "Content-Type: application/json" \
+          -d '{"email": "user@example.com", "password": "securePassword123"}'
+
+    Response (200):
+        {
+          "token": "eyJhbGciOiJIUzI1NiIs..."
+        }
+
+    ---------------------------------------------------------
+    POST /api/urls
+    ---------------------------------------------------------
+    Create a short URL. Requires authentication.
+
+    Request:
+        curl -X POST http://localhost:3000/api/urls \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
+          -d '{"url": "https://example.com/very/long/path"}'
+
+    Response (201):
+        {
+          "id": "550e8400-e29b-41d4-a716-446655440000",
+          "shortCode": "Ax7bK2",
+          "shortUrl": "http://localhost:3000/Ax7bK2",
+          "originalUrl": "https://example.com/very/long/path",
+          "expiresAt": null,
+          "createdAt": "2024-01-15T10:30:00.000Z"
+        }
+
+    Errors:
+        400 — Invalid URL, blocked protocol, or private IP
+        401 — Missing or invalid authentication
+
+    ---------------------------------------------------------
+    GET /:code
+    ---------------------------------------------------------
+    Redirect to the original URL. No authentication required.
+
+    Request:
+        curl -L http://localhost:3000/Ax7bK2
+        # -L follows redirects
+
+    Response:
+        302 redirect to the original URL
+
+    Errors:
+        404 — Short code not found or expired
+
+    ---------------------------------------------------------
+    GET /api/urls/:code/stats
+    ---------------------------------------------------------
+    Get click statistics for a short URL. Requires authentication.
+
+    Request:
+        curl http://localhost:3000/api/urls/Ax7bK2/stats \
+          -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
+
+    Response (200):
+        {
+          "shortCode": "Ax7bK2",
+          "totalClicks": 142,
+          "clicksByDay": [
+            {"date": "2024-01-14", "count": 45},
+            {"date": "2024-01-15", "count": 97}
+          ],
+          "topReferrers": [
+            {"referrer": "twitter.com", "count": 89},
+            {"referrer": "direct", "count": 53}
+          ]
+        }
+
+    ---------------------------------------------------------
+    GET /api/health
+    ---------------------------------------------------------
+    Health check endpoint. No authentication required.
+
+    Request:
+        curl http://localhost:3000/api/health
+
+    Response (200):
+        {
+          "status": "ok",
+          "postgres": "connected",
+          "redis": "connected",
+          "uptime": 3600
+        }
+
+    ---------------------------------------------------------
+    GET /metrics
+    ---------------------------------------------------------
+    Prometheus metrics endpoint. No authentication required.
+
+    Request:
+        curl http://localhost:3000/metrics
+
+    Response (200):
+        # HELP http_requests_total Total HTTP requests
+        # TYPE http_requests_total counter
+        http_requests_total{method="GET",route="/:code",status="302"} 1542
+        ...
+
+--- END OF EXAMPLE ---
+
+
+================================================================================
+STEP 17: ARCHITECTURE DIAGRAM
+================================================================================
+
+Use Mermaid syntax — GitHub renders it natively in README files.
+
+--- MERMAID DIAGRAM (paste in your README.md) ---
+
+    ```mermaid
+    graph TB
+        subgraph "Client Layer"
+            Browser[Browser/Frontend]
+            CLI[Go CLI Tool]
+            API_Client[API Client]
+        end
+
+        subgraph "Ingress Layer"
+            Nginx[Nginx<br/>Rate Limiting<br/>SSL Termination<br/>Gzip Compression]
+        end
+
+        subgraph "Application Layer"
+            App1[Fastify App 1]
+            App2[Fastify App 2]
+            App3[Fastify App N...]
+        end
+
+        subgraph "Caching Layer"
+            Redis[Redis<br/>URL Cache<br/>Rate Limit Counters<br/>Session Store]
+        end
+
+        subgraph "Connection Pool"
+            PgBouncer[PgBouncer<br/>Transaction Pooling<br/>200 client conns → 20 PG conns]
+        end
+
+        subgraph "Data Layer"
+            Postgres[(PostgreSQL<br/>URLs, Users, API Keys<br/>Source of Truth)]
+        end
+
+        subgraph "Event Streaming"
+            Kafka[Apache Kafka<br/>Click Events Topic]
+            Consumer[Kafka Consumer<br/>Batch Insert to Postgres]
+        end
+
+        subgraph "Monitoring"
+            Prometheus[Prometheus<br/>Metrics Scraping]
+            Grafana[Grafana<br/>Dashboards & Alerts]
+        end
+
+        Browser --> Nginx
+        CLI --> Nginx
+        API_Client --> Nginx
+        Nginx --> App1
+        Nginx --> App2
+        Nginx --> App3
+        App1 --> Redis
+        App2 --> Redis
+        App3 --> Redis
+        App1 --> PgBouncer
+        App2 --> PgBouncer
+        App3 --> PgBouncer
+        PgBouncer --> Postgres
+        App1 --> Kafka
+        App2 --> Kafka
+        App3 --> Kafka
+        Kafka --> Consumer
+        Consumer --> Postgres
+        Prometheus --> App1
+        Prometheus --> App2
+        Prometheus --> App3
+        Grafana --> Prometheus
+    ```
+
+--- END OF DIAGRAM ---
+
+This diagram should go in your README.md. GitHub renders Mermaid blocks
+automatically — no plugins needed.
+
+
+================================================================================
+STEP 18: DESIGN DECISIONS DOCUMENT
+================================================================================
+
+Write a short section documenting WHY you made key architecture choices.
+This is the most valuable part of documentation because code shows WHAT
+you did, but not WHY.
+
+Format:
+
+    Decision: Use Redis for URL caching
+    Alternatives considered: In-memory Map, Memcached
+    Why Redis: Persistent across restarts, shared across app instances,
+               built-in TTL, data structures (sorted sets for leaderboards).
+    Trade-off: Extra infrastructure to manage. Worth it for horizontal scaling.
+
+    Decision: Kafka for click event streaming
+    Alternatives considered: BullMQ (Redis-based), RabbitMQ, direct DB insert
+    Why Kafka: Durable, ordered, replayable event log. Handles traffic spikes
+               by buffering events. Decouples click tracking from redirect latency.
+    Trade-off: Complex to operate. Overkill for <1000 req/s. Right choice for learning.
+
+    Decision: PgBouncer for connection pooling
+    Alternatives considered: Drizzle's built-in pool, pgpool-II
+    Why PgBouncer: Lightweight, single-purpose, battle-tested. Transaction mode
+                   works perfectly for our stateless queries.
+    Trade-off: Another service to manage. Essential once you have >3 app replicas.
+
+    Decision: Drizzle ORM over Prisma
+    Alternatives considered: Prisma, Knex, raw SQL
+    Why Drizzle: SQL-like syntax (less ORM magic), excellent TypeScript types,
+                 better ESM support, generates actual SQL you can read.
+    Trade-off: Smaller community than Prisma. Migration tooling still maturing.
+
+    Decision: Fastify over Express
+    Alternatives considered: Express, Koa, Hono
+    Why Fastify: 2-3x faster than Express, built-in schema validation,
+                 TypeScript-first, plugin system prevents middleware spaghetti.
+    Trade-off: Smaller ecosystem than Express. Some packages need @fastify/ versions.
+
+These decisions tell a STORY. In a job interview, when someone asks
+"Why did you choose X over Y?", you have a clear, thoughtful answer.
+
+
+================================================================================
+CHECKPOINT: WHAT YOU SHOULD HAVE AFTER WEEK 8
+================================================================================
+
+1. CI/CD PIPELINE (GitHub Actions)
+   - ci.yml: Runs lint + typecheck + tests on every push
+   - docker-publish.yml: Builds and pushes Docker image on merge to main
+   - Tests use real Postgres + Redis (GitHub Actions services)
+   - Docker image published to ghcr.io/YOUR_USERNAME/tinyscale
+
+2. SECURITY HARDENING
+   - Helmet.js for HTTP security headers (CSP, HSTS, etc.)
+   - CORS configured with explicit allowed origins
+   - URL validation: blocks javascript:, data:, private IPs, userinfo tricks
+   - npm audit in CI pipeline
+   - Docker image scanning with Trivy
+   - Understanding of OWASP Top 10 and how each applies to TinyScale
+
+3. DATABASE OPERATIONS
+   - Drizzle migration workflow (generate -> review -> migrate -> commit)
+   - Backup script (pg_dump + gzip + retention cleanup)
+   - Restore process tested and documented
+   - PgBouncer for connection pooling (200 app conns -> 20 PG conns)
+
+4. DOCUMENTATION
+   - API reference with curl examples for every endpoint
+   - Architecture diagram (Mermaid)
+   - Design decisions with trade-offs documented
+
+5. MENTAL MODEL
+   - You understand why CI/CD exists (automated quality gates)
+   - You understand CORS (browser same-origin policy + preflight)
+   - You understand why migrations exist (versioned, auditable schema changes)
+   - You understand connection pooling (connection cost + max_connections limit)
+   - You can explain the OWASP Top 10 in terms of your own project
+
+YOUR TINYSCALE ARCHITECTURE NOW:
+
+    User / CLI / API Client
+         |
+         v
+    Nginx (rate limit, SSL, gzip, CORS preflight)
+         |
+         v
+    Fastify App (Helmet headers, auth, URL validation)
+         |
+         |---> Redis (URL cache, rate limits)
+         |
+         |---> PgBouncer (connection pooling)
+         |         |
+         |         +--> Postgres (source of truth, migrations)
+         |                  |
+         |                  +--> pg_dump (nightly backups)
+         |
+         |---> Kafka (click events)
+         |         |
+         |         +--> Consumer (batch insert)
+         |
+         +--> /metrics --> Prometheus --> Grafana
+         |
+         +--> GitHub Actions (CI: lint+test, CD: build+push image)
+
+WHAT TO PUT ON YOUR RESUME:
+- "Implemented CI/CD pipeline with GitHub Actions: lint, type check, test, Docker publish"
+- "Hardened API security: Helmet.js, CORS, input validation, OWASP Top 10 review"
+- "Set up database migration workflow, automated backups, and PgBouncer connection pooling"
+- "Documented API with curl examples, architecture diagrams, and design decision records"
+
+================================================================================
+END OF WEEK 8
+================================================================================
+
+NEXT WEEK: Week 9 is about Load Testing + Performance Optimization +
+Horizontal Scaling — you'll use k6 or Artillery to hammer your API,
+find bottlenecks, and optimize. You'll learn about database indexes,
+query optimization, caching strategies, and what happens when one
+instance isn't enough. But that's for next week. For now, make sure
+your CI/CD pipeline is green, your security headers are set, your
+backups work, and your documentation is written.

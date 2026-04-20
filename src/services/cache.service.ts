@@ -1,4 +1,5 @@
 import { type FastifyInstance } from "fastify";
+import { cacheHitsTotal, cacheMissesTotal } from "../plugins/metrics.plugin.js";
 
 // Default TTL: 1 hour (in seconds)
 const DEFAULT_TTL = 3600;
@@ -22,6 +23,7 @@ export async function cacheGet<T>(
     const cached = await app.redis.get(cacheKey);
     if (cached !== null) {
       app.log.debug({ key: cacheKey }, "Cache HIT");
+      cacheHitsTotal.inc();
       return JSON.parse(cached) as T;
     }
   } catch (err) {
@@ -30,6 +32,7 @@ export async function cacheGet<T>(
   }
 
   app.log.debug({ key: cacheKey }, "Cache MISS");
+  cacheMissesTotal.inc();
   const value = await fetchFn();
 
   try {

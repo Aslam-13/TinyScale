@@ -1,0 +1,2088 @@
+================================================================================
+                    WEEK 7: KUBERNETES BASICS + DEPLOYING PROPERLY
+                    ===============================================
+                    Your Goal: Move from docker-compose to
+                    Kubernetes. Understand orchestration, self-healing,
+                    scaling, and zero-downtime deployments. Deploy
+                    TinyScale on a real K8s cluster (locally).
+================================================================================
+
+
+================================================================================
+DAY 1-2: KUBERNETES CONCEPTS (BEFORE TOUCHING kubectl)
+================================================================================
+
+BEFORE YOU RUN ANY COMMANDS - READ AND UNDERSTAND THIS:
+---------------------------------------------------------
+
+>> WHAT PROBLEM DOES KUBERNETES SOLVE? <<
+
+You've been running TinyScale with docker-compose. It works great on your
+machine. Let's think about what happens when you need to run this in
+production:
+
+    Scenario 1: Your app crashes at 3 AM
+    docker-compose: The container dies. Nobody notices until morning.
+    Kubernetes: Detects the crash in seconds, restarts the container,
+                sends alerts. Users never notice.
+
+    Scenario 2: Traffic spikes 10x (your link goes viral)
+    docker-compose: You manually SSH in, edit docker-compose.yml to
+                    add more replicas, run docker-compose up -d.
+                    By then, your site has been down for 20 minutes.
+    Kubernetes: Automatically detects high CPU/request load, spins up
+                more pods (containers), routes traffic to them.
+                Users experience a brief slowdown, not downtime.
+
+    Scenario 3: You need to deploy a new version
+    docker-compose: docker-compose down (site is DOWN), pull new image,
+                    docker-compose up (site is back). Downtime: 30-60 seconds.
+    Kubernetes: Gradually replaces old containers with new ones. At no
+                point are zero containers running. Downtime: ZERO.
+
+    Scenario 4: The server running your app dies (hardware failure)
+    docker-compose: Everything is gone. You SSH into a new server,
+                    set up Docker, copy your compose file, restart.
+    Kubernetes: Detects the dead node, reschedules all containers
+                to other healthy nodes in your cluster. Automatic.
+
+    Scenario 5: You have 15 microservices that need to talk to each other
+    docker-compose: You hardcode service names and ports in each service.
+                    If you rename a service, you update every other service.
+    Kubernetes: Built-in service discovery. Services find each other
+                by name automatically through internal DNS.
+
+docker-compose is a DEVELOPMENT tool. Kubernetes is a PRODUCTION orchestrator.
+
+>> BUT ISN'T KUBERNETES OVERKILL? <<
+
+For a personal project? Maybe. For anything with users? No.
+
+Here's the thing: you're not learning Kubernetes because TinyScale needs it.
+You're learning it because EVERY company you'll work at uses it (or something
+like it). When you join a team, you'll see YAML manifests, kubectl commands,
+pod logs, and deployment pipelines. If you've never seen these before, you'll
+be lost for months.
+
+By setting it up yourself on a small project, you'll understand what those
+production configs actually DO.
+
+
+>> DOCKER-COMPOSE vs KUBERNETES: THE FULL COMPARISON <<
+
+    Feature                  Docker Compose              Kubernetes
+    -------------------      ----------------------      --------------------------
+    Purpose                  Local development           Production orchestration
+    Scaling                  Manual (replicas: N)        Automatic (HPA)
+    Self-healing             None (restart: always       Full — detects crash,
+                             is basic at best)           reschedules, replaces
+    Zero-downtime deploy     No                          Yes (rolling updates)
+    Service discovery        Docker DNS (basic)          Full DNS + load balancing
+    Config management        .env files                  ConfigMaps + Secrets
+                                                         (encrypted, versioned)
+    Storage                  Docker volumes              PersistentVolumeClaims
+                                                         (dynamic provisioning)
+    Load balancing           None built-in               Built-in per-service
+    SSL/TLS                  You configure Nginx         Ingress controllers handle it
+    Resource limits          Optional                    Enforced (OOMKilled if exceeded)
+    Health checks            None                        Liveness + Readiness probes
+    Multi-node               No (single machine)         Yes (cluster of machines)
+    Rollback                 Manual                      One command: kubectl rollback
+    Production-ready         No                          Yes
+
+You already know Docker. Kubernetes just adds an ORCHESTRATION layer on top.
+Your containers are the same. The images are the same. The Dockerfiles don't
+change. What changes is HOW you tell the system to run, scale, and manage them.
+
+
+================================================================================
+KUBERNETES CONCEPTS — EVERY TERM EXPLAINED
+================================================================================
+
+You need to know these concepts BEFORE writing any YAML. Each one is explained
+with a Docker Compose analogy so you can map it to what you already know.
+
+--- POD ---
+
+A Pod is the smallest deployable unit in Kubernetes.
+
+    Docker Compose equivalent: a single container
+    But with a twist: a Pod can contain MULTIPLE containers that share
+    the same network namespace (localhost) and storage volumes.
+
+In practice, 95% of your Pods will have exactly one container. But the
+concept matters because sometimes you need a "sidecar" container (like a
+log collector or proxy) running alongside your main container.
+
+    # Your docker-compose.yml
+    services:
+      app:               <-- This becomes a Pod in K8s
+        image: tinyscale:latest
+        ports:
+          - "3000:3000"
+
+    # In Kubernetes thinking:
+    # Pod = one instance of your app container running somewhere in the cluster
+
+A Pod is EPHEMERAL — it can be killed and recreated at any time. Never treat
+a Pod as permanent. That's why you never create Pods directly. You create
+Deployments (which manage Pods for you).
+
+
+--- DEPLOYMENT ---
+
+A Deployment tells Kubernetes: "I want N copies of this Pod running at all
+times. If one dies, create a new one. If I update the image, do a rolling
+update."
+
+    Docker Compose equivalent: a service with `replicas: 3`
+    But WAY more powerful — handles rolling updates, rollbacks, and self-healing.
+
+    # docker-compose.yml
+    services:
+      app:
+        image: tinyscale:latest
+        deploy:
+          replicas: 3          <-- "I want 3 copies"
+
+    # Kubernetes Deployment says the same thing, plus:
+    #   - If a Pod crashes, replace it automatically
+    #   - When updating, replace Pods one at a time (rolling update)
+    #   - Keep the old version around so you can rollback
+
+A Deployment creates a ReplicaSet (which manages the actual Pods).
+You almost never interact with ReplicaSets directly.
+
+    Deployment (you define this)
+        |
+        +--> ReplicaSet (Kubernetes creates this)
+                |
+                +--> Pod 1 (running tinyscale:latest)
+                +--> Pod 2 (running tinyscale:latest)
+                +--> Pod 3 (running tinyscale:latest)
+
+
+--- SERVICE ---
+
+A Service gives a STABLE network endpoint to a set of Pods.
+
+    Docker Compose equivalent: the service name you use for networking
+    In docker-compose, you access Postgres as `postgres:5432`.
+    That's because Docker creates a DNS entry for each service.
+    Kubernetes Services do the same thing, but with load balancing.
+
+Problem Pods solve: Pods are ephemeral. They get new IP addresses every time
+they restart. You can't hardcode a Pod's IP address anywhere.
+
+Solution: A Service gets a stable DNS name and IP. It routes traffic to
+whichever Pods are currently running.
+
+    Without Service:
+        App Pod 1 --> Pod IP 10.0.0.5 (Postgres)   <-- This IP changes!
+
+    With Service:
+        App Pod 1 --> postgres-service (DNS name)    <-- Always works
+                          |
+                          +--> routes to whichever Postgres Pod is alive
+
+Service types:
+    ClusterIP (default):  Only accessible within the cluster. Use for
+                          internal services (Postgres, Redis).
+    NodePort:             Exposes service on each node's IP at a static port.
+                          Good for development/debugging.
+    LoadBalancer:         Creates an external load balancer (cloud providers).
+                          This is how you expose your app to the internet.
+
+
+--- INGRESS ---
+
+An Ingress is an HTTP routing layer that sits in front of your Services.
+
+    Docker Compose equivalent: Your Nginx reverse proxy.
+    Remember your nginx.conf that routes / to the app? Ingress does that,
+    plus SSL termination, path-based routing, and host-based routing.
+
+    # Your current Nginx config (simplified):
+    server {
+        listen 80;
+        location / {
+            proxy_pass http://app:3000;
+        }
+    }
+
+    # Kubernetes Ingress does the same thing:
+    # - Routes external HTTP traffic to internal Services
+    # - Can route based on hostname (api.tinyscale.com vs www.tinyscale.com)
+    # - Can route based on path (/api -> app-service, /grafana -> grafana-service)
+    # - Handles SSL certificates automatically (with cert-manager)
+
+Ingress needs an Ingress Controller to actually work. Popular ones:
+    - ingress-nginx (the one we'll use — NOT the same as your manual Nginx)
+    - Traefik
+    - HAProxy
+
+The Ingress Controller is itself a Pod running in your cluster that watches
+for Ingress resources and configures routing automatically.
+
+
+--- CONFIGMAP ---
+
+A ConfigMap stores non-sensitive configuration as key-value pairs.
+
+    Docker Compose equivalent: environment variables in your .env file
+    or the `environment:` section in docker-compose.yml.
+
+    # docker-compose.yml
+    services:
+      app:
+        environment:
+          DATABASE_URL: "postgres://dev:dev@postgres:5432/tinyscale"
+          REDIS_URL: "redis://redis:6379"
+          NODE_ENV: "production"
+
+    # In Kubernetes, you put these in a ConfigMap and reference them.
+    # Benefits over .env files:
+    #   - Versioned (you can see what changed and when)
+    #   - Can be shared across multiple Deployments
+    #   - Can be updated without rebuilding the container image
+    #   - Can be mounted as files (not just env vars)
+
+
+--- SECRET ---
+
+A Secret stores SENSITIVE data (passwords, API keys, certificates).
+
+    Docker Compose equivalent: You've been putting passwords in .env files
+    or hardcoding them in docker-compose.yml. That's terrible for production.
+
+    # Your docker-compose.yml right now (DON'T do this in production):
+    services:
+      postgres:
+        environment:
+          POSTGRES_PASSWORD: dev     <-- Plaintext password in a config file!
+
+    # Kubernetes Secrets:
+    #   - Base64 encoded (not encrypted by default, but can be with tools)
+    #   - Access controlled (RBAC — only certain services can read them)
+    #   - Can be rotated without restarting Pods
+    #   - Not stored in your git repo (you apply them separately)
+
+Secrets are base64 encoded, NOT encrypted. In production, you'd use:
+    - AWS Secrets Manager / Azure Key Vault / Google Secret Manager
+    - Sealed Secrets (encrypted Secrets that are safe to commit to git)
+    - External Secrets Operator
+
+For local development with minikube, base64 encoding is fine.
+
+
+--- NAMESPACE ---
+
+A Namespace is a virtual cluster inside your cluster.
+
+    Docker Compose equivalent: Nothing directly. But think of it like
+    separate docker-compose projects in different directories.
+
+Namespaces let you:
+    - Isolate environments (dev, staging, production) in one cluster
+    - Apply different resource quotas per namespace
+    - Control access (team A can only see namespace A)
+
+Default namespaces in every cluster:
+    default        — where your stuff goes if you don't specify
+    kube-system    — Kubernetes system components (don't touch this)
+    kube-public    — Publicly accessible data (rarely used)
+
+We'll use a `tinyscale` namespace to keep our stuff organized.
+
+
+--- STATEFULSET ---
+
+A StatefulSet is like a Deployment, but for STATEFUL applications.
+
+    Docker Compose equivalent: a service with a named volume
+    But much more sophisticated.
+
+Why can't you use a regular Deployment for Postgres?
+
+    Deployment behavior:
+        Pod dies → new Pod is created → gets NEW name, NEW storage
+        This is FINE for stateless apps (your Node.js app).
+        This is CATASTROPHIC for databases (your data is gone).
+
+    StatefulSet behavior:
+        Pod dies → new Pod is created → gets SAME name, SAME storage
+        postgres-0 always gets the volume for postgres-0.
+        The Pod identity is STICKY.
+
+StatefulSet guarantees:
+    1. Stable network identity: pods are named pod-0, pod-1, pod-2 (not random)
+    2. Stable storage: each pod gets its own PersistentVolumeClaim
+    3. Ordered deployment: pod-0 starts before pod-1, pod-1 before pod-2
+    4. Ordered termination: pod-2 stops before pod-1, pod-1 before pod-0
+
+This is critical for databases:
+    - Postgres primary must start before replicas
+    - Each instance needs its own data directory
+    - You can't just randomly kill database pods
+
+For Redis in our setup (used as a cache, not persistent storage), a regular
+Deployment is fine. If Redis data is lost, the cache just gets cold — no
+data loss.
+
+
+--- PERSISTENTVOLUMECLAIM (PVC) ---
+
+A PVC is a request for storage that persists beyond Pod lifetime.
+
+    Docker Compose equivalent: named volumes
+    # docker-compose.yml
+    volumes:
+      postgres_data:       <-- This is essentially a PVC
+
+    services:
+      postgres:
+        volumes:
+          - postgres_data:/var/lib/postgresql/data
+
+In Kubernetes:
+    PersistentVolume (PV):       The actual storage (disk on a node, EBS volume, NFS share)
+    PersistentVolumeClaim (PVC): A REQUEST for storage ("I need 5GB of SSD storage")
+
+You usually just create a PVC. Kubernetes finds or creates a PV that matches.
+In minikube, storage is automatically provisioned from the host machine.
+
+
+================================================================================
+QUICK REFERENCE: KUBERNETES OBJECT HIERARCHY
+================================================================================
+
+    Cluster
+    |
+    +--> Nodes (machines in your cluster)
+    |       |
+    |       +--> Pods (running containers)
+    |
+    +--> Namespaces (virtual clusters)
+    |       |
+    |       +--> Deployments --> ReplicaSets --> Pods
+    |       +--> StatefulSets --> Pods (with sticky identity)
+    |       +--> Services (stable network endpoints)
+    |       +--> Ingress (HTTP routing rules)
+    |       +--> ConfigMaps (configuration)
+    |       +--> Secrets (sensitive configuration)
+    |       +--> PersistentVolumeClaims (storage requests)
+    |
+    +--> Ingress Controller (routes external traffic)
+
+    In your TinyScale cluster:
+    Namespace: tinyscale
+        |
+        +--> Deployment: tinyscale-app (3 replicas)
+        |       +--> Pod: tinyscale-app-abc123
+        |       +--> Pod: tinyscale-app-def456
+        |       +--> Pod: tinyscale-app-ghi789
+        |
+        +--> StatefulSet: postgres (1 replica)
+        |       +--> Pod: postgres-0
+        |       +--> PVC: postgres-data-postgres-0
+        |
+        +--> Deployment: redis (1 replica)
+        |       +--> Pod: redis-abc123
+        |
+        +--> Service: tinyscale-app-service (ClusterIP)
+        +--> Service: postgres-service (ClusterIP)
+        +--> Service: redis-service (ClusterIP)
+        +--> Ingress: tinyscale-ingress
+        +--> ConfigMap: tinyscale-config
+        +--> Secret: tinyscale-secrets
+
+
+================================================================================
+DAY 3-4: SET UP LOCAL KUBERNETES + DEPLOY TINYSCALE
+================================================================================
+
+>> STEP 1: INSTALL MINIKUBE <<
+
+Minikube runs a single-node Kubernetes cluster on your local machine.
+It creates a virtual machine (or uses Docker) that acts as both the
+control plane and a worker node.
+
+Other options:
+    minikube — Most popular for local dev. We'll use this.
+    kind     — Kubernetes IN Docker. Lighter weight, but less features.
+    k3s      — Lightweight K8s distribution. Great for Raspberry Pi.
+    Docker Desktop — Has built-in K8s, but less configurable.
+
+INSTALL ON WINDOWS:
+
+Option A: Using winget (recommended):
+
+    winget install Kubernetes.minikube
+
+Option B: Using Chocolatey:
+
+    choco install minikube
+
+Option C: Direct download:
+    Go to https://minikube.sigs.k8s.io/docs/start/
+    Download the Windows installer (.exe)
+    Run the installer.
+
+After installation, verify:
+
+    minikube version
+    # Should print: minikube version: v1.33.x (or newer)
+
+INSTALL kubectl (the Kubernetes CLI):
+
+kubectl comes bundled with minikube, but you should also install it separately:
+
+    winget install Kubernetes.kubectl
+
+Verify:
+
+    kubectl version --client
+    # Should print: Client Version: v1.30.x (or newer)
+
+
+>> STEP 2: START YOUR CLUSTER <<
+
+    minikube start --driver=docker --cpus=4 --memory=4096
+
+THINGS TO UNDERSTAND:
+
+1. `--driver=docker` — Uses Docker as the "VM" driver. Since you already
+   have Docker Desktop installed, this is the fastest option on Windows.
+   Other drivers: hyperv, virtualbox, qemu.
+
+2. `--cpus=4` — Allocate 4 CPU cores to the cluster. Kubernetes itself
+   uses some resources, so you need more than you think.
+
+3. `--memory=4096` — Allocate 4GB RAM. Postgres + Redis + 3 app replicas +
+   Kubernetes system pods need at least this much.
+
+After it starts (takes 1-3 minutes):
+
+    kubectl cluster-info
+    # Should show the cluster is running
+
+    kubectl get nodes
+    # NAME       STATUS   ROLES           AGE   VERSION
+    # minikube   Ready    control-plane   1m    v1.30.x
+
+WINDOWS GOTCHAS:
+
+1. DOCKER DESKTOP MUST BE RUNNING. Minikube with the Docker driver needs
+   Docker Desktop to be running. Start it before running minikube start.
+
+2. HYPER-V vs WSL2: If you're using Docker Desktop with WSL2 backend
+   (recommended), minikube will use that. If you're using Hyper-V,
+   you might need `--driver=hyperv` instead.
+
+3. PATH ISSUES: If `minikube` or `kubectl` aren't found, make sure
+   their install directories are in your PATH:
+       C:\Program Files\Kubernetes\Minikube\
+       C:\Program Files\kubectl\
+
+4. RESOURCE LIMITS: On Windows, Docker Desktop has its own resource limits
+   (Settings > Resources). Make sure Docker Desktop is allowed at least
+   4 CPUs and 6GB RAM, so minikube can get its 4 CPUs and 4GB.
+
+5. FILE SHARING: If you need to mount local files into minikube, you'll
+   need `minikube mount`. We won't need this for our setup.
+
+
+>> STEP 3: ENABLE THE INGRESS ADDON <<
+
+Minikube has built-in addons. We need the ingress controller:
+
+    minikube addons enable ingress
+
+This installs the nginx ingress controller in your cluster. Verify:
+
+    kubectl get pods -n ingress-nginx
+    # Should show ingress-nginx-controller running
+
+This is a Pod INSIDE your cluster that watches for Ingress resources and
+configures Nginx routing automatically. It replaces your manual Nginx setup
+from docker-compose.
+
+
+>> STEP 4: SET UP THE NAMESPACE <<
+
+    kubectl create namespace tinyscale
+
+Verify:
+
+    kubectl get namespaces
+    # Should show tinyscale in the list
+
+Set tinyscale as your default namespace (so you don't have to type -n tinyscale
+on every command):
+
+    kubectl config set-context --current --namespace=tinyscale
+
+
+>> STEP 5: BUILD YOUR DOCKER IMAGE FOR MINIKUBE <<
+
+IMPORTANT: Minikube runs its own Docker daemon, separate from your host's
+Docker daemon. If you build an image on your host, minikube can't see it.
+
+Solution: Tell your terminal to use minikube's Docker daemon:
+
+    # On Windows (PowerShell):
+    & minikube -p minikube docker-env --shell powershell | Invoke-Expression
+
+    # On Windows (Git Bash / WSL):
+    eval $(minikube docker-env)
+
+Now when you run `docker build`, the image is built INSIDE minikube:
+
+    docker build -t tinyscale:latest .
+
+Verify the image is in minikube:
+
+    docker images | grep tinyscale
+
+THINGS TO UNDERSTAND:
+
+1. This `eval $(minikube docker-env)` trick only affects your CURRENT terminal
+   session. Open a new terminal and you're back to the host Docker daemon.
+
+2. In production, you'd push images to a registry (Docker Hub, ECR, GCR)
+   and Kubernetes would pull them. For local development, building directly
+   inside minikube is faster.
+
+3. Make sure your Dockerfile is production-ready (multi-stage build, non-root
+   user, etc.). If you didn't do this in earlier weeks, here's what it should
+   look like:
+
+--- FILE: Dockerfile (production-ready, multi-stage) ---
+
+    FROM node:20-alpine AS builder
+    WORKDIR /app
+    COPY package*.json ./
+    RUN npm ci
+    COPY . .
+    RUN npm run build
+
+    FROM node:20-alpine AS runner
+    WORKDIR /app
+
+    # Create a non-root user
+    RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+    COPY --from=builder /app/dist ./dist
+    COPY --from=builder /app/node_modules ./node_modules
+    COPY --from=builder /app/package*.json ./
+    COPY --from=builder /app/drizzle ./drizzle
+
+    USER appuser
+    EXPOSE 3000
+    CMD ["node", "dist/server.js"]
+
+--- END OF FILE ---
+
+
+================================================================================
+STEP 6: CREATE THE KUBERNETES MANIFESTS
+================================================================================
+
+Create a `k8s/` directory in your TinyScale project:
+
+    mkdir k8s
+
+We'll create one file per resource. This is the standard approach — one YAML
+file per Kubernetes object. Some teams put everything in one file separated
+by `---`, but separate files are easier to manage.
+
+Your k8s directory will look like this:
+
+    k8s/
+    |-- namespace.yaml
+    |-- configmap.yaml
+    |-- secrets.yaml
+    |-- postgres-pvc.yaml
+    |-- postgres-statefulset.yaml
+    |-- postgres-service.yaml
+    |-- redis-deployment.yaml
+    |-- redis-service.yaml
+    |-- app-deployment.yaml
+    |-- app-service.yaml
+    +-- ingress.yaml
+
+
+--- FILE: k8s/namespace.yaml ---
+
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: tinyscale
+      labels:
+        app: tinyscale
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. Every Kubernetes resource has four required fields:
+   - `apiVersion` — which API version to use (v1, apps/v1, networking.k8s.io/v1)
+   - `kind` — what type of resource (Namespace, Deployment, Service, etc.)
+   - `metadata` — name, labels, annotations
+   - `spec` — the actual specification (what you want)
+
+2. `labels` are key-value pairs used for SELECTING resources. They're how
+   Services find Pods, how Deployments manage ReplicaSets, etc.
+   Think of them as tags. Everything that belongs together shares a label.
+
+
+--- FILE: k8s/configmap.yaml ---
+
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: tinyscale-config
+      namespace: tinyscale
+    data:
+      NODE_ENV: "production"
+      PORT: "3000"
+      DATABASE_HOST: "postgres-service"
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: "tinyscale"
+      REDIS_HOST: "redis-service"
+      REDIS_PORT: "6379"
+      LOG_LEVEL: "info"
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. Notice `DATABASE_HOST: "postgres-service"` — this is the Kubernetes Service
+   name, not a container name. In docker-compose you used `postgres` because
+   Docker DNS resolved it. In Kubernetes, Services provide DNS resolution.
+   The full DNS name is `postgres-service.tinyscale.svc.cluster.local`
+   but within the same namespace, just `postgres-service` works.
+
+2. ALL values in a ConfigMap are STRINGS. Even PORT: "3000" is a string.
+   Your app needs to parse these (which Node.js does naturally with
+   process.env).
+
+3. No passwords here! Those go in Secrets.
+
+
+--- FILE: k8s/secrets.yaml ---
+
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: tinyscale-secrets
+      namespace: tinyscale
+    type: Opaque
+    data:
+      DATABASE_USER: ZGV2           # base64 encoded "dev"
+      DATABASE_PASSWORD: ZGV2       # base64 encoded "dev"
+      JWT_SECRET: c3VwZXItc2VjcmV0LWp3dC1rZXktY2hhbmdlLWluLXByb2R1Y3Rpb24=
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. Values are BASE64 ENCODED, not encrypted. To create them:
+
+       # On Linux/Mac/Git Bash:
+       echo -n "dev" | base64
+       # Output: ZGV2
+
+       # On Windows PowerShell:
+       [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("dev"))
+       # Output: ZGV2
+
+   The `-n` flag in echo is CRITICAL — it prevents a trailing newline.
+   Without it, you'd encode "dev\n" instead of "dev", and your password
+   would be wrong. This is a common gotcha.
+
+2. `type: Opaque` means arbitrary key-value data. Other types:
+   - `kubernetes.io/tls` for TLS certificates
+   - `kubernetes.io/dockerconfigjson` for Docker registry credentials
+
+3. IN PRODUCTION: Never commit Secrets to git. Use:
+   - `kubectl create secret` command (apply directly)
+   - Sealed Secrets (encrypted in git, decrypted in cluster)
+   - External Secrets Operator (fetches from AWS/Azure/GCP secret managers)
+
+4. For local development, committing base64 secrets is fine. But add a
+   comment reminding yourself these are development-only values.
+
+
+--- FILE: k8s/postgres-pvc.yaml ---
+
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: postgres-data
+      namespace: tinyscale
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: standard
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `ReadWriteOnce` — the volume can be mounted as read-write by ONE node.
+   Other options:
+   - `ReadOnlyMany` — read-only by many nodes
+   - `ReadWriteMany` — read-write by many nodes (needs NFS or similar)
+   For a single Postgres instance, ReadWriteOnce is correct.
+
+2. `storage: 1Gi` — requesting 1 gigabyte. In minikube, this is allocated
+   from your host machine's disk. In cloud, this creates an actual disk
+   (EBS volume on AWS, Persistent Disk on GCP).
+
+3. `storageClassName: standard` — minikube's default storage class. In
+   production, you'd choose between SSD (fast, expensive) and HDD (slow, cheap).
+
+4. This PVC will be used by the Postgres StatefulSet below. The data
+   survives Pod restarts, which is the whole point.
+
+
+--- FILE: k8s/postgres-statefulset.yaml ---
+
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: postgres
+      namespace: tinyscale
+    spec:
+      serviceName: postgres-service
+      replicas: 1
+      selector:
+        matchLabels:
+          app: tinyscale
+          component: postgres
+      template:
+        metadata:
+          labels:
+            app: tinyscale
+            component: postgres
+        spec:
+          containers:
+            - name: postgres
+              image: postgres:16-alpine
+              ports:
+                - containerPort: 5432
+              env:
+                - name: POSTGRES_DB
+                  valueFrom:
+                    configMapKeyRef:
+                      name: tinyscale-config
+                      key: DATABASE_NAME
+                - name: POSTGRES_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: tinyscale-secrets
+                      key: DATABASE_USER
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: tinyscale-secrets
+                      key: DATABASE_PASSWORD
+                - name: PGDATA
+                  value: /var/lib/postgresql/data/pgdata
+              volumeMounts:
+                - name: postgres-storage
+                  mountPath: /var/lib/postgresql/data
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              livenessProbe:
+                exec:
+                  command:
+                    - pg_isready
+                    - -U
+                    - dev
+                initialDelaySeconds: 30
+                periodSeconds: 10
+              readinessProbe:
+                exec:
+                  command:
+                    - pg_isready
+                    - -U
+                    - dev
+                initialDelaySeconds: 5
+                periodSeconds: 5
+          volumes:
+            - name: postgres-storage
+              persistentVolumeClaim:
+                claimName: postgres-data
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND — THIS IS THE MOST COMPLEX MANIFEST, READ CAREFULLY:
+
+1. `kind: StatefulSet` NOT `kind: Deployment`:
+   We explained why above. Postgres needs stable identity and persistent
+   storage. StatefulSet guarantees the Pod name is always `postgres-0`
+   and always gets the same PVC.
+
+2. `serviceName: postgres-service`:
+   StatefulSets require a "headless" service (we'll create it next).
+   This links the StatefulSet to its Service for DNS resolution.
+
+3. `selector.matchLabels` must match `template.metadata.labels`:
+   This is how the StatefulSet knows which Pods belong to it.
+   app: tinyscale + component: postgres = "I manage Pods with these labels."
+
+4. `env` using `valueFrom`:
+   Instead of hardcoding values, we reference ConfigMaps and Secrets.
+
+       # docker-compose way (hardcoded):
+       environment:
+         POSTGRES_PASSWORD: dev
+
+       # Kubernetes way (referenced):
+       env:
+         - name: POSTGRES_PASSWORD
+           valueFrom:
+             secretKeyRef:
+               name: tinyscale-secrets
+               key: DATABASE_PASSWORD
+
+   This means you can change the password in the Secret without changing
+   the StatefulSet manifest. Separation of concerns.
+
+5. `PGDATA: /var/lib/postgresql/data/pgdata`:
+   This tells Postgres to use a subdirectory inside the mounted volume.
+   Without this, Postgres complains because the mount point has a
+   `lost+found` directory (from the filesystem).
+
+6. `resources.requests` vs `resources.limits`:
+   - requests: The MINIMUM resources Kubernetes guarantees for this Pod.
+     The scheduler uses this to find a node with enough room.
+   - limits: The MAXIMUM resources this Pod can use.
+     If it exceeds the memory limit, Kubernetes OOMKills it.
+     If it exceeds the CPU limit, it gets throttled (slowed down, not killed).
+
+       requests:
+         cpu: 250m      # 250 millicores = 0.25 CPU cores
+         memory: 256Mi  # 256 megabytes
+       limits:
+         cpu: 500m      # 500 millicores = 0.5 CPU cores
+         memory: 512Mi  # 512 megabytes
+
+   CPU is measured in millicores: 1000m = 1 full CPU core.
+   Memory is measured in Mi (mebibytes) or Gi (gibibytes).
+
+7. `livenessProbe`:
+   "Is this container ALIVE?" If the liveness probe fails N times in a row,
+   Kubernetes KILLS the container and restarts it.
+
+   We use `pg_isready` — a Postgres utility that checks if the server
+   is accepting connections.
+
+   `initialDelaySeconds: 30` — wait 30 seconds after start before
+   checking. Postgres needs time to initialize.
+   `periodSeconds: 10` — check every 10 seconds.
+
+8. `readinessProbe`:
+   "Is this container READY to receive traffic?" If the readiness probe
+   fails, the Pod is removed from Service endpoints (no traffic routed to it)
+   but NOT killed.
+
+   Difference:
+   - Liveness: "Are you alive?" No? RESTART.
+   - Readiness: "Can you handle requests?" No? STOP SENDING TRAFFIC (but don't kill).
+
+   Example: Postgres is alive but running a huge migration. It's ALIVE (don't
+   kill it) but NOT READY (don't send queries to it).
+
+
+--- FILE: k8s/postgres-service.yaml ---
+
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: postgres-service
+      namespace: tinyscale
+      labels:
+        app: tinyscale
+        component: postgres
+    spec:
+      type: ClusterIP
+      clusterIP: None
+      selector:
+        app: tinyscale
+        component: postgres
+      ports:
+        - port: 5432
+          targetPort: 5432
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `clusterIP: None` — This makes it a "headless" Service. Instead of getting
+   one virtual IP that load-balances across Pods, each Pod gets its own DNS
+   entry: `postgres-0.postgres-service.tinyscale.svc.cluster.local`
+
+   For StatefulSets, headless services are standard practice because you often
+   need to address specific Pods (e.g., primary vs replica).
+
+2. `selector` matches the labels on the Postgres Pods. This is how the
+   Service knows which Pods to route traffic to.
+
+3. `type: ClusterIP` — only accessible within the cluster. You don't want
+   your database exposed to the internet.
+
+4. Other Pods in the `tinyscale` namespace can reach Postgres at:
+   `postgres-service:5432`
+   This is what we set in the ConfigMap as DATABASE_HOST.
+
+
+--- FILE: k8s/redis-deployment.yaml ---
+
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: redis
+      namespace: tinyscale
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: tinyscale
+          component: redis
+      template:
+        metadata:
+          labels:
+            app: tinyscale
+            component: redis
+        spec:
+          containers:
+            - name: redis
+              image: redis:7-alpine
+              ports:
+                - containerPort: 6379
+              command: ["redis-server"]
+              args: ["--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+              livenessProbe:
+                tcpSocket:
+                  port: 6379
+                initialDelaySeconds: 10
+                periodSeconds: 10
+              readinessProbe:
+                exec:
+                  command:
+                    - redis-cli
+                    - ping
+                initialDelaySeconds: 5
+                periodSeconds: 5
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `kind: Deployment` not StatefulSet — Redis is used as a CACHE in our
+   architecture. If Redis restarts and loses data, the cache just gets cold.
+   No data is permanently lost. The source of truth is Postgres.
+
+   If you were using Redis as a persistent data store (like for BullMQ job
+   queues), you'd want a StatefulSet with persistence. For caching, a
+   Deployment is fine.
+
+2. `command` + `args` override the container's default CMD:
+   `--maxmemory 128mb` — Redis won't use more than 128MB of memory.
+   `--maxmemory-policy allkeys-lru` — When full, evict least recently used keys.
+   This prevents Redis from eating all available memory and getting OOMKilled.
+
+3. `livenessProbe.tcpSocket` — Just checks if port 6379 is open.
+   Simpler than exec'ing a command, good enough for "is Redis alive?"
+
+4. `readinessProbe` uses `redis-cli ping` — expects "PONG" response.
+   This confirms Redis is not just alive but actually ready to serve.
+
+
+--- FILE: k8s/redis-service.yaml ---
+
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: redis-service
+      namespace: tinyscale
+      labels:
+        app: tinyscale
+        component: redis
+    spec:
+      type: ClusterIP
+      selector:
+        app: tinyscale
+        component: redis
+      ports:
+        - port: 6379
+          targetPort: 6379
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. NOT a headless service (no `clusterIP: None`). Redis gets a single
+   virtual IP that routes to the Redis Pod. Since we only have one Redis
+   Pod, this is fine.
+
+2. Your app connects to Redis at `redis-service:6379` — the Service name
+   we set in the ConfigMap.
+
+
+--- FILE: k8s/app-deployment.yaml ---
+
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: tinyscale-app
+      namespace: tinyscale
+    spec:
+      replicas: 3
+      selector:
+        matchLabels:
+          app: tinyscale
+          component: api
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 0
+      template:
+        metadata:
+          labels:
+            app: tinyscale
+            component: api
+        spec:
+          containers:
+            - name: tinyscale-app
+              image: tinyscale:latest
+              imagePullPolicy: Never
+              ports:
+                - containerPort: 3000
+              envFrom:
+                - configMapRef:
+                    name: tinyscale-config
+              env:
+                - name: DATABASE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: tinyscale-secrets
+                      key: DATABASE_USER
+                - name: DATABASE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: tinyscale-secrets
+                      key: DATABASE_PASSWORD
+                - name: JWT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: tinyscale-secrets
+                      key: JWT_SECRET
+                - name: DATABASE_URL
+                  value: "postgres://$(DATABASE_USER):$(DATABASE_PASSWORD)@postgres-service:5432/tinyscale"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 3000
+                initialDelaySeconds: 15
+                periodSeconds: 10
+                failureThreshold: 3
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: 3000
+                initialDelaySeconds: 5
+                periodSeconds: 5
+                failureThreshold: 3
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND — THIS IS YOUR MAIN APPLICATION DEPLOYMENT:
+
+1. `replicas: 3` — Three copies of your app running simultaneously.
+   In docker-compose, you had one app behind Nginx. Now you have three
+   Pods behind a Kubernetes Service that load-balances between them.
+
+2. `strategy.type: RollingUpdate`:
+   - `maxSurge: 1` — During an update, create at most 1 extra Pod (so
+     briefly 4 Pods exist while transitioning).
+   - `maxUnavailable: 0` — Never have fewer than 3 running Pods during
+     an update. Combined with maxSurge: 1, this means:
+     Step 1: Create new Pod (4 total: 3 old + 1 new)
+     Step 2: Once new Pod is ready, terminate 1 old Pod (3 total: 2 old + 1 new)
+     Step 3: Create new Pod (4 total: 2 old + 2 new)
+     Step 4: Once ready, terminate 1 old Pod (3 total: 1 old + 2 new)
+     Step 5: Create new Pod (4 total: 1 old + 3 new)
+     Step 6: Once ready, terminate last old Pod (3 total: 0 old + 3 new)
+     Result: ZERO DOWNTIME. At least 3 Pods were always running.
+
+3. `imagePullPolicy: Never`:
+   Since we built the image directly inside minikube (using
+   `eval $(minikube docker-env)`), we tell Kubernetes NOT to try pulling
+   from a remote registry. Without this, you'd get ImagePullBackOff errors.
+
+   In production, you'd use `imagePullPolicy: IfNotPresent` or `Always`
+   and push images to a real registry.
+
+4. `envFrom.configMapRef`:
+   Loads ALL keys from the ConfigMap as environment variables at once.
+   Instead of listing each one individually, `envFrom` is a shortcut:
+   All keys in `tinyscale-config` become env vars automatically.
+
+5. `env` for Secrets:
+   Secrets are loaded individually because you typically need explicit
+   control over sensitive values.
+
+6. `DATABASE_URL` uses variable substitution:
+   `$(DATABASE_USER)` and `$(DATABASE_PASSWORD)` are replaced by Kubernetes
+   with the values from the Secret. This constructs the connection string
+   dynamically.
+
+7. `livenessProbe.httpGet`:
+   Kubernetes makes an HTTP GET request to `/health` on port 3000.
+   If it returns 2xx or 3xx, the Pod is alive.
+   If it fails 3 times in a row (`failureThreshold: 3`), the Pod is killed
+   and restarted.
+
+   You should already have a /health endpoint in your Fastify app from
+   earlier weeks. If not, add one:
+
+       app.get('/health', async () => {
+           return { status: 'ok', timestamp: new Date().toISOString() };
+       });
+
+8. `readinessProbe`:
+   Same endpoint, but checks if the Pod is ready for traffic.
+   A Pod might be alive but still connecting to the database. The readiness
+   probe prevents routing traffic to it until /health succeeds.
+
+
+--- FILE: k8s/app-service.yaml ---
+
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: tinyscale-app-service
+      namespace: tinyscale
+      labels:
+        app: tinyscale
+        component: api
+    spec:
+      type: ClusterIP
+      selector:
+        app: tinyscale
+        component: api
+      ports:
+        - port: 80
+          targetPort: 3000
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `port: 80, targetPort: 3000`:
+   External port 80 maps to container port 3000. Other services in the
+   cluster call `tinyscale-app-service:80` and traffic is routed to
+   port 3000 inside one of the 3 app Pods.
+
+2. The Service automatically load-balances across all 3 Pods that match
+   the selector (`app: tinyscale, component: api`). Round-robin by default.
+
+
+--- FILE: k8s/ingress.yaml ---
+
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: tinyscale-ingress
+      namespace: tinyscale
+      annotations:
+        nginx.ingress.kubernetes.io/rewrite-target: /
+        nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+        nginx.ingress.kubernetes.io/rate-limit: "100"
+        nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    spec:
+      ingressClassName: nginx
+      rules:
+        - host: tinyscale.local
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: tinyscale-app-service
+                    port:
+                      number: 80
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. This REPLACES your Nginx reverse proxy from docker-compose.
+   The Ingress Controller (installed by `minikube addons enable ingress`)
+   reads this manifest and configures its internal Nginx automatically.
+
+2. `host: tinyscale.local`:
+   The Ingress routes requests for this hostname. For local development,
+   you need to add this to your hosts file:
+
+   On Windows, edit C:\Windows\System32\drivers\etc\hosts (as Administrator):
+
+       <minikube-ip>  tinyscale.local
+
+   Get the minikube IP:
+
+       minikube ip
+       # Example output: 192.168.49.2
+
+   Then add to hosts file:
+
+       192.168.49.2  tinyscale.local
+
+3. `annotations` configure the ingress controller's behavior:
+   - `rewrite-target: /` — rewrites the URL path
+   - `proxy-body-size: "10m"` — max request body size
+   - `rate-limit` — basic rate limiting (your Nginx config had this too)
+
+4. `ingressClassName: nginx` — tells Kubernetes to use the nginx Ingress
+   Controller (the one we enabled with minikube addons).
+
+5. In production, you'd add TLS configuration here:
+
+       spec:
+         tls:
+           - hosts:
+               - api.tinyscale.com
+             secretName: tinyscale-tls-cert
+
+
+================================================================================
+STEP 7: DEPLOY EVERYTHING
+================================================================================
+
+Now deploy all manifests. ORDER MATTERS — dependencies first:
+
+    # 1. Namespace first (everything else goes in it)
+    kubectl apply -f k8s/namespace.yaml
+
+    # 2. Config and secrets (referenced by other resources)
+    kubectl apply -f k8s/configmap.yaml
+    kubectl apply -f k8s/secrets.yaml
+
+    # 3. Storage (needed before databases)
+    kubectl apply -f k8s/postgres-pvc.yaml
+
+    # 4. Databases (app depends on them)
+    kubectl apply -f k8s/postgres-statefulset.yaml
+    kubectl apply -f k8s/postgres-service.yaml
+    kubectl apply -f k8s/redis-deployment.yaml
+    kubectl apply -f k8s/redis-service.yaml
+
+    # 5. Wait for databases to be ready
+    kubectl wait --for=condition=ready pod -l component=postgres --timeout=120s
+    kubectl wait --for=condition=ready pod -l component=redis --timeout=60s
+
+    # 6. Application (depends on databases)
+    kubectl apply -f k8s/app-deployment.yaml
+    kubectl apply -f k8s/app-service.yaml
+
+    # 7. Ingress (depends on app service)
+    kubectl apply -f k8s/ingress.yaml
+
+Or, if you're feeling confident, apply everything at once:
+
+    kubectl apply -f k8s/
+
+Kubernetes will figure out the dependency order (mostly). But if your app
+starts before Postgres is ready, it might crash and restart a few times.
+That's fine — Kubernetes will keep restarting it until Postgres is ready.
+This is self-healing in action.
+
+VERIFY EVERYTHING IS RUNNING:
+
+    kubectl get all -n tinyscale
+
+Expected output (after 1-2 minutes):
+
+    NAME                                  READY   STATUS    RESTARTS   AGE
+    pod/postgres-0                        1/1     Running   0          2m
+    pod/redis-abc123-xyz                  1/1     Running   0          2m
+    pod/tinyscale-app-abc123-def          1/1     Running   0          1m
+    pod/tinyscale-app-abc123-ghi          1/1     Running   0          1m
+    pod/tinyscale-app-abc123-jkl          1/1     Running   0          1m
+
+    NAME                              TYPE        CLUSTER-IP       PORT(S)
+    service/postgres-service          ClusterIP   None             5432/TCP
+    service/redis-service             ClusterIP   10.96.123.45     6379/TCP
+    service/tinyscale-app-service     ClusterIP   10.96.123.46     80/TCP
+
+    NAME                              READY   UP-TO-DATE   AVAILABLE   AGE
+    deployment.apps/redis             1/1     1            1           2m
+    deployment.apps/tinyscale-app     3/3     3            3           1m
+
+    NAME                              READY   AGE
+    statefulset.apps/postgres         1/1     2m
+
+If any Pods are not Running, debug them (see the debugging section below).
+
+
+>> RUN DATABASE MIGRATIONS <<
+
+Your app needs the database tables. Run Drizzle migrations:
+
+    # Get the name of one of your app Pods
+    kubectl get pods -l component=api
+
+    # Exec into it and run migrations
+    kubectl exec -it deployment/tinyscale-app -- npx drizzle-kit push
+
+Alternatively, you can run migrations as a Kubernetes Job (a one-time task):
+
+--- FILE: k8s/migration-job.yaml (optional, for automated migrations) ---
+
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: tinyscale-migration
+      namespace: tinyscale
+    spec:
+      template:
+        spec:
+          containers:
+            - name: migration
+              image: tinyscale:latest
+              imagePullPolicy: Never
+              command: ["npx", "drizzle-kit", "push"]
+              envFrom:
+                - configMapRef:
+                    name: tinyscale-config
+              env:
+                - name: DATABASE_URL
+                  value: "postgres://dev:dev@postgres-service:5432/tinyscale"
+          restartPolicy: Never
+      backoffLimit: 3
+
+--- END OF FILE ---
+
+Apply it:
+
+    kubectl apply -f k8s/migration-job.yaml
+
+Check if it completed:
+
+    kubectl get jobs -n tinyscale
+    kubectl logs job/tinyscale-migration
+
+
+>> TEST YOUR DEPLOYMENT <<
+
+    # Option 1: Via Ingress (if hosts file is configured)
+    curl http://tinyscale.local/health
+
+    # Option 2: Port-forward directly to the app service
+    kubectl port-forward service/tinyscale-app-service 3000:80
+
+    # Then in another terminal:
+    curl http://localhost:3000/health
+
+    # Option 3: Use minikube service command
+    minikube service tinyscale-app-service -n tinyscale --url
+
+You should see your health check response:
+
+    {"status":"ok","timestamp":"2026-04-14T12:00:00.000Z"}
+
+
+================================================================================
+kubectl COMMANDS CHEAT SHEET
+================================================================================
+
+VIEWING RESOURCES:
+    kubectl get pods                     # List all pods in current namespace
+    kubectl get pods -o wide             # Show more details (node, IP)
+    kubectl get all                      # Show pods, services, deployments
+    kubectl get pods -l component=api    # Filter by label
+    kubectl get pods --all-namespaces    # All namespaces (or -A)
+    kubectl get events --sort-by='.lastTimestamp'   # Recent events
+
+INSPECTING RESOURCES:
+    kubectl describe pod <pod-name>      # Full details of a pod
+    kubectl describe deployment tinyscale-app  # Deployment details
+    kubectl describe service tinyscale-app-service  # Service details
+    kubectl describe ingress tinyscale-ingress  # Ingress details
+
+LOGS:
+    kubectl logs <pod-name>              # Container logs
+    kubectl logs <pod-name> -f           # Follow logs (like docker logs -f)
+    kubectl logs <pod-name> --previous   # Logs from PREVIOUS container
+                                         # (after a crash/restart)
+    kubectl logs -l component=api        # Logs from all Pods with label
+    kubectl logs deployment/tinyscale-app # Logs from one Pod in deployment
+
+EXECUTING COMMANDS:
+    kubectl exec -it <pod-name> -- bash       # Shell into a pod
+    kubectl exec -it <pod-name> -- sh         # Alpine images use sh, not bash
+    kubectl exec <pod-name> -- env            # View env vars in pod
+    kubectl exec -it postgres-0 -- psql -U dev tinyscale   # Postgres shell
+
+PORT FORWARDING:
+    kubectl port-forward service/tinyscale-app-service 3000:80
+    kubectl port-forward pod/postgres-0 5432:5432
+
+SCALING:
+    kubectl scale deployment tinyscale-app --replicas=5   # Scale to 5
+    kubectl scale deployment tinyscale-app --replicas=1   # Scale down to 1
+
+UPDATING:
+    kubectl set image deployment/tinyscale-app tinyscale-app=tinyscale:v2
+    kubectl rollout status deployment/tinyscale-app    # Watch the rollout
+    kubectl rollout undo deployment/tinyscale-app      # Rollback to previous
+    kubectl rollout history deployment/tinyscale-app   # Deployment history
+
+DELETING:
+    kubectl delete pod <pod-name>            # Delete a pod (deployment
+                                             # creates a new one!)
+    kubectl delete -f k8s/                   # Delete everything from manifests
+    kubectl delete namespace tinyscale       # Delete everything in namespace
+
+DEBUGGING:
+    kubectl top pods                         # CPU/memory usage per pod
+    kubectl top nodes                        # CPU/memory usage per node
+    kubectl get events --field-selector reason=Failed
+
+
+================================================================================
+DEBUGGING COMMON ISSUES
+================================================================================
+
+These are the errors you WILL encounter. Don't panic. Read the error,
+understand what it means, fix it.
+
+--- CrashLoopBackOff ---
+
+WHAT IT MEANS:
+Your container starts, crashes, Kubernetes restarts it, it crashes again,
+and so on. Kubernetes backs off (waits longer between restarts).
+
+HOW TO DEBUG:
+    kubectl logs <pod-name>              # Check application logs
+    kubectl logs <pod-name> --previous   # Logs from the crashed container
+    kubectl describe pod <pod-name>      # Check Events section at the bottom
+
+COMMON CAUSES:
+1. App can't connect to database (Postgres not ready yet)
+   Fix: Add readiness checks, or just wait — K8s will keep restarting
+   until Postgres is ready.
+
+2. Missing environment variables
+   Fix: Check your ConfigMap and Secrets. kubectl exec into the pod and
+   run `env` to see what's actually set.
+
+3. Application error (bug in your code)
+   Fix: Read the logs. Fix the bug. Rebuild the image.
+
+4. Wrong command in the container (e.g., node dist/server.js but dist/
+   doesn't exist because build failed)
+   Fix: Check your Dockerfile build step.
+
+
+--- ImagePullBackOff ---
+
+WHAT IT MEANS:
+Kubernetes can't pull the container image.
+
+HOW TO DEBUG:
+    kubectl describe pod <pod-name>   # Check the Events section
+
+COMMON CAUSES:
+1. Image not found (typo in image name)
+   Fix: Check the image name in your Deployment spec.
+
+2. Image built on host Docker, not minikube Docker
+   Fix: Run `eval $(minikube docker-env)` first, THEN `docker build`.
+
+3. `imagePullPolicy: Always` but image only exists locally
+   Fix: Set `imagePullPolicy: Never` or `IfNotPresent` for local images.
+
+4. Private registry without credentials
+   Fix: Create a docker-registry Secret and reference it in the Pod spec.
+
+
+--- Pending Pods ---
+
+WHAT IT MEANS:
+The Pod is created but not scheduled to any node.
+
+HOW TO DEBUG:
+    kubectl describe pod <pod-name>   # Check Events and Conditions
+
+COMMON CAUSES:
+1. Insufficient resources (not enough CPU or memory on the node)
+   Fix: Reduce resource requests, or increase minikube resources:
+   `minikube stop && minikube start --cpus=4 --memory=6144`
+
+2. PersistentVolumeClaim not bound (no storage available)
+   Fix: Check `kubectl get pvc`. If it's Pending, the StorageClass
+   might be wrong. Use `standard` for minikube.
+
+3. Node selector or affinity doesn't match any node
+   Fix: Check if your Pod has nodeSelector or affinity rules.
+
+
+--- Service Not Reachable ---
+
+WHAT IT MEANS:
+Your Service exists but you can't connect to it.
+
+HOW TO DEBUG:
+    kubectl get endpoints <service-name>   # Check if service has endpoints
+
+If endpoints are empty, the Service selector doesn't match any Pod labels.
+
+    # Check Service selector:
+    kubectl describe service tinyscale-app-service
+
+    # Check Pod labels:
+    kubectl get pods --show-labels
+
+The selector labels on the Service MUST match labels on the Pods.
+
+
+--- OOMKilled ---
+
+WHAT IT MEANS:
+Your container used more memory than its limit and Kubernetes killed it.
+
+HOW TO DEBUG:
+    kubectl describe pod <pod-name>
+    # Look for: Last State: Terminated, Reason: OOMKilled
+
+Fix: Increase memory limits, or fix the memory leak in your application.
+
+    resources:
+      limits:
+        memory: 512Mi   # Increase from 256Mi
+
+
+================================================================================
+DAY 5-6: KUBERNETES FEATURES THAT MATTER
+================================================================================
+
+>> HORIZONTAL POD AUTOSCALER (HPA) <<
+
+The HPA automatically scales the number of Pods based on metrics. This is
+what makes Kubernetes different from "3 replicas in docker-compose" — it
+REACTS to load.
+
+First, enable the metrics server in minikube:
+
+    minikube addons enable metrics-server
+
+Wait a minute, then verify:
+
+    kubectl top pods -n tinyscale
+    # Should show CPU and memory usage per pod
+
+Now create the HPA:
+
+--- FILE: k8s/hpa.yaml ---
+
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata:
+      name: tinyscale-app-hpa
+      namespace: tinyscale
+    spec:
+      scaleTargetRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: tinyscale-app
+      minReplicas: 2
+      maxReplicas: 10
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 50
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
+
+--- END OF FILE ---
+
+THINGS TO UNDERSTAND:
+
+1. `scaleTargetRef` — Points to the Deployment to scale. The HPA watches
+   `tinyscale-app` and adjusts its replica count.
+
+2. `minReplicas: 2, maxReplicas: 10`:
+   - Never fewer than 2 (so if one crashes, you still have one running).
+   - Never more than 10 (cost control — don't scale infinitely).
+
+3. `metrics`:
+   - Scale up when average CPU across all Pods exceeds 50%.
+   - Scale up when average memory across all Pods exceeds 70%.
+   Either condition triggers scaling.
+
+4. `behavior.scaleUp`:
+   - `stabilizationWindowSeconds: 30` — Wait 30 seconds of consistently
+     high metrics before adding Pods. Prevents scaling on short spikes.
+   - `policies` — Add at most 2 Pods per 60-second period.
+
+5. `behavior.scaleDown`:
+   - `stabilizationWindowSeconds: 300` — Wait 5 MINUTES of consistently
+     low metrics before removing Pods. Scale-down is SLOW on purpose.
+     You don't want to remove Pods just because load dropped for 30 seconds.
+   - Remove at most 1 Pod per 2-minute period.
+
+   This asymmetry is intentional:
+   Scale UP fast (users are waiting) → Scale DOWN slowly (be cautious).
+
+Apply it:
+
+    kubectl apply -f k8s/hpa.yaml
+
+Watch the HPA in action:
+
+    kubectl get hpa -n tinyscale -w
+    # The -w flag watches for changes in real-time
+
+
+>> TEST THE HPA WITH k6 <<
+
+Open a terminal and watch the HPA:
+
+    kubectl get hpa -n tinyscale -w
+
+In another terminal, set up port forwarding:
+
+    kubectl port-forward service/tinyscale-app-service 3000:80
+
+In a third terminal, run your k6 load test (from Week 5/6):
+
+    k6 run --vus 100 --duration 2m load-test.js
+
+Watch the first terminal. After ~30 seconds of high load, you should see:
+
+    NAME                  REFERENCE                TARGETS          MINPODS   MAXPODS   REPLICAS
+    tinyscale-app-hpa     Deployment/tinyscale-app  78%/50%          2         10        2
+    tinyscale-app-hpa     Deployment/tinyscale-app  78%/50%          2         10        4
+    tinyscale-app-hpa     Deployment/tinyscale-app  52%/50%          2         10        6
+
+Kubernetes saw CPU at 78% (above the 50% target), and added Pods until the
+average dropped below 50%. After the load test ends, wait 5+ minutes and
+you'll see replicas scale back down.
+
+
+>> LIVENESS AND READINESS PROBES — DEEPER DIVE <<
+
+We already added probes in our manifests. Let's understand what happens
+when they fail.
+
+EXPERIMENT 1: Kill the health endpoint
+
+    # Exec into one of your app pods
+    kubectl get pods -l component=api
+    kubectl exec -it <pod-name> -- sh
+
+    # Your app probably doesn't have a way to disable /health from inside.
+    # Instead, let's watch what happens when you kill the process.
+    # Exit the shell, then delete the Pod:
+    kubectl delete pod <pod-name>
+
+Watch what happens:
+
+    kubectl get pods -w
+
+You'll see the Pod terminate, and within seconds a new Pod appears.
+The Deployment controller detected a missing Pod and created a replacement.
+
+EXPERIMENT 2: What readiness probes do
+
+Readiness probes determine whether a Pod receives traffic. If you set up
+port-forwarding to the Service (not a specific Pod), you'll see that
+Kubernetes only routes to READY Pods.
+
+During a rolling update, new Pods are only added to the Service's
+endpoints AFTER their readiness probe succeeds. This is how zero-downtime
+deploys work.
+
+
+>> RESOURCE LIMITS — WHAT HAPPENS WHEN YOU EXCEED THEM <<
+
+CPU LIMITS:
+When a container exceeds its CPU limit, it gets THROTTLED.
+The process doesn't crash — it just runs slower. Requests take longer.
+
+MEMORY LIMITS:
+When a container exceeds its memory limit, it gets OOMKilled.
+The process is IMMEDIATELY terminated. Kubernetes restarts it.
+
+EXPERIMENT: Set a very low memory limit
+
+    # Edit app-deployment.yaml temporarily:
+    resources:
+      limits:
+        memory: 32Mi    # Way too low for a Node.js app
+
+    kubectl apply -f k8s/app-deployment.yaml
+    kubectl get pods -w
+
+    # You'll see:
+    # tinyscale-app-xyz   0/1   OOMKilled   0   5s
+    # tinyscale-app-xyz   0/1   CrashLoopBackOff   1   10s
+
+Node.js needs at least ~60-80MB just to start. 32Mi is not enough.
+Kubernetes kills it immediately, restarts it, it dies again, backs off.
+
+Fix it by setting realistic limits:
+
+    resources:
+      requests:
+        memory: 128Mi    # Minimum guaranteed
+      limits:
+        memory: 256Mi    # Maximum allowed
+
+IMPORTANT: Always set both requests AND limits.
+- Requests without limits: Pod can use unlimited resources, starving others.
+- Limits without requests: requests defaults to limits (wasteful).
+- Both: Pod is guaranteed `requests` and bounded by `limits`.
+
+
+>> ROLLING UPDATES — ZERO DOWNTIME DEPLOYMENTS <<
+
+This is one of Kubernetes' most important features. Let's see it in action.
+
+Step 1: Make a code change (add a version to your health endpoint):
+
+    // In your health endpoint:
+    app.get('/health', async () => {
+        return {
+            status: 'ok',
+            version: '2.0.0',
+            timestamp: new Date().toISOString()
+        };
+    });
+
+Step 2: Build a new image (inside minikube's Docker):
+
+    eval $(minikube docker-env)
+    docker build -t tinyscale:v2 .
+
+Step 3: Update the Deployment to use the new image:
+
+    kubectl set image deployment/tinyscale-app \
+        tinyscale-app=tinyscale:v2 -n tinyscale
+
+Step 4: Watch the rollout:
+
+    kubectl rollout status deployment/tinyscale-app -n tinyscale
+
+    # Output:
+    # Waiting for deployment "tinyscale-app" rollout to finish:
+    #   1 out of 3 new replicas have been updated...
+    #   2 out of 3 new replicas have been updated...
+    #   3 out of 3 new replicas have been updated...
+    #   deployment "tinyscale-app" successfully rolled out
+
+During this rollout, watch Pods in another terminal:
+
+    kubectl get pods -w -n tinyscale
+
+    # You'll see new Pods being created and old Pods being terminated:
+    # tinyscale-app-OLD-abc   1/1   Running       0   30m
+    # tinyscale-app-OLD-def   1/1   Running       0   30m
+    # tinyscale-app-OLD-ghi   1/1   Running       0   30m
+    # tinyscale-app-NEW-123   0/1   Pending       0   0s
+    # tinyscale-app-NEW-123   0/1   ContainerCreating  0   1s
+    # tinyscale-app-NEW-123   1/1   Running       0   5s
+    # tinyscale-app-OLD-abc   1/1   Terminating   0   30m
+    # ... (repeats for each Pod)
+
+AT NO POINT WERE ZERO PODS RUNNING. Users experienced zero downtime.
+
+Step 5: If the new version has a bug, ROLLBACK:
+
+    kubectl rollout undo deployment/tinyscale-app -n tinyscale
+
+This reverts to the previous version. Another zero-downtime rollout, but
+in reverse. You'll see v2 Pods being replaced by v1 Pods.
+
+Check the rollout history:
+
+    kubectl rollout history deployment/tinyscale-app
+
+    # REVISION  CHANGE-CAUSE
+    # 1         <none>
+    # 3         <none>
+    # 2         <none>       (current after undo)
+
+Tip: Add `--record` when doing updates to record the command in history:
+
+    kubectl set image deployment/tinyscale-app \
+        tinyscale-app=tinyscale:v2 --record
+
+
+>> LOAD TEST DURING A ROLLING UPDATE <<
+
+This is the ultimate test. Can your app handle load while deploying?
+
+Terminal 1: Watch pods:
+
+    kubectl get pods -w -n tinyscale
+
+Terminal 2: Port-forward:
+
+    kubectl port-forward service/tinyscale-app-service 3000:80 -n tinyscale
+
+Terminal 3: Start a k6 load test:
+
+    k6 run --vus 50 --duration 3m load-test.js
+
+Terminal 4: While the load test is running, trigger a rolling update:
+
+    kubectl set image deployment/tinyscale-app \
+        tinyscale-app=tinyscale:v2 -n tinyscale
+
+Watch Terminal 3. The k6 results should show:
+- Request rate stays steady (no drop to zero)
+- Some requests might be slightly slower during Pod replacement
+- No (or very few) failed requests
+
+If you see many failed requests during the update, check:
+1. Are your readiness probes configured correctly?
+2. Is maxUnavailable set to 0?
+3. Does your app handle SIGTERM gracefully? (Fastify does this by default
+   with `app.close()`)
+
+
+================================================================================
+DAY 7: UNDERSTANDING WHAT JUST HAPPENED
+================================================================================
+
+>> ARCHITECTURE DIAGRAM: YOUR K8s CLUSTER <<
+
+    EXTERNAL TRAFFIC
+         |
+         v
+    +-----------------------------------------+
+    |  MINIKUBE CLUSTER (single node)         |
+    |                                          |
+    |  +------------------------------------+  |
+    |  |  INGRESS CONTROLLER (nginx)        |  |
+    |  |  Routes HTTP to Services           |  |
+    |  +--+--+------------------------------+  |
+    |     |  |                                  |
+    |     |  |  +-----------+                   |
+    |     |  +->| Service:  |                   |
+    |     |     | app-svc   |                   |
+    |     |     +--+--+--+--+                   |
+    |     |        |  |  |                      |
+    |     |        v  v  v                      |
+    |     |     +---+---+---+                   |
+    |     |     |Pod|Pod|Pod| (tinyscale-app)   |
+    |     |     | 1 | 2 | 3 | x3 replicas      |
+    |     |     +--+--+--+--+                   |
+    |     |        |     |                      |
+    |     |   +----+     +----+                 |
+    |     |   |               |                 |
+    |     |   v               v                 |
+    |     | +----------+  +----------+          |
+    |     | | Service: |  | Service: |          |
+    |     | | postgres |  | redis    |          |
+    |     | +----+-----+  +----+-----+          |
+    |     |      |              |               |
+    |     |      v              v               |
+    |     | +----------+  +----------+          |
+    |     | |postgres-0|  |redis Pod |          |
+    |     | |StatefulSt|  |Deployment|          |
+    |     | +----+-----+  +----------+          |
+    |     |      |                              |
+    |     |      v                              |
+    |     | +----------+                        |
+    |     | |   PVC    |                        |
+    |     | | 1Gi disk |                        |
+    |     | +----------+                        |
+    |     |                                     |
+    |     |  ConfigMap: tinyscale-config         |
+    |     |  Secret: tinyscale-secrets           |
+    |     |  HPA: tinyscale-app-hpa             |
+    |     |                                     |
+    +-----------------------------------------+
+
+Compare this to your docker-compose architecture:
+
+    docker-compose:                  Kubernetes:
+    ---------------                  -----------
+    Nginx container                  Ingress Controller
+    1 app container                  3 app Pods (auto-scalable to 10)
+    Postgres container               Postgres StatefulSet with PVC
+    Redis container                  Redis Deployment
+    .env file                        ConfigMap + Secrets
+    docker-compose up                kubectl apply -f k8s/
+    Manual restart on crash          Automatic self-healing
+    Manual scaling                   Horizontal Pod Autoscaler
+    Downtime on deploy               Zero-downtime rolling updates
+
+You went from a development setup to a production-grade orchestrated deployment.
+
+
+>> WHAT YOU SHOULD UNDERSTAND NOW <<
+
+1. WHY Kubernetes exists — Docker only runs containers. Kubernetes ORCHESTRATES
+   them: scheduling, scaling, healing, updating, networking, storage.
+
+2. Every K8s resource type and when to use it:
+   - Deployment: stateless apps (your API, Redis cache)
+   - StatefulSet: stateful apps (Postgres, Kafka)
+   - Service: stable networking between Pods
+   - Ingress: external HTTP routing (replaces Nginx reverse proxy)
+   - ConfigMap: non-sensitive configuration
+   - Secret: sensitive configuration
+   - PVC: persistent storage
+   - HPA: automatic scaling
+
+3. The deployment lifecycle:
+   Build image -> Create manifests -> kubectl apply -> K8s schedules Pods ->
+   Probes check health -> Service routes traffic -> HPA watches metrics
+
+4. How to debug:
+   kubectl describe (events) -> kubectl logs (app output) ->
+   kubectl exec (inspect container) -> kubectl get events (cluster events)
+
+
+================================================================================
+CHECKPOINT: WHAT YOU SHOULD HAVE BY END OF WEEK 7
+================================================================================
+
+AT THIS POINT YOU SHOULD HAVE:
+
+1. RUNNING KUBERNETES CLUSTER
+   - Minikube running with 4 CPUs and 4GB RAM
+   - Ingress controller enabled
+   - Metrics server enabled
+   - tinyscale namespace created
+
+2. DEPLOYED APPLICATION (11 manifests):
+   - namespace.yaml
+   - configmap.yaml
+   - secrets.yaml
+   - postgres-pvc.yaml
+   - postgres-statefulset.yaml
+   - postgres-service.yaml
+   - redis-deployment.yaml
+   - redis-service.yaml
+   - app-deployment.yaml (3 replicas)
+   - app-service.yaml
+   - ingress.yaml
+
+3. WORKING FEATURES:
+   - 3 replicas of your app load-balanced by a Service
+   - Postgres with persistent storage (data survives restarts)
+   - Redis as a cache
+   - Ingress routing external traffic to your app
+   - Liveness and readiness probes on all containers
+   - Resource limits on all containers
+   - HPA auto-scaling between 2 and 10 replicas
+
+4. DEMONSTRATED CAPABILITIES:
+   - Zero-downtime rolling update (kubectl set image + rollout status)
+   - Rollback to previous version (kubectl rollout undo)
+   - Self-healing (delete a Pod, watch it get recreated)
+   - Auto-scaling (k6 load test triggers HPA to add Pods)
+   - Load test during rolling update (no downtime)
+
+5. DEBUGGING SKILLS:
+   - Can identify and fix CrashLoopBackOff
+   - Can identify and fix ImagePullBackOff
+   - Can identify and fix Pending Pods
+   - Can identify and fix OOMKilled
+   - Can read kubectl describe output
+
+YOUR TINYSCALE ARCHITECTURE NOW:
+
+    User
+     |
+     v
+    Ingress Controller (replaces Nginx)
+     |
+     v
+    Service (load balancer)
+     |
+     +--> Pod 1 (tinyscale-app)
+     +--> Pod 2 (tinyscale-app)      <-- HPA can scale to 10
+     +--> Pod 3 (tinyscale-app)
+            |
+            |---> Redis Service --> Redis Pod (cache)
+            |
+            |---> Postgres Service --> postgres-0 (StatefulSet)
+            |                              |
+            |                              +--> PVC (persistent 1Gi disk)
+            |
+            +--> /metrics --> Prometheus --> Grafana
+
+    ConfigMap: environment configuration
+    Secrets: passwords, JWT key
+    HPA: auto-scales Pods based on CPU/memory
+
+WHAT TO PUT ON YOUR RESUME:
+- "Migrated from Docker Compose to Kubernetes for production deployment"
+- "Configured StatefulSets for PostgreSQL with persistent storage"
+- "Implemented HPA auto-scaling, zero-downtime rolling updates"
+- "Set up liveness/readiness probes, resource limits, and Ingress routing"
+- "Debugged CrashLoopBackOff, OOMKilled, and other K8s failure modes"
+
+================================================================================
+END OF WEEK 7
+================================================================================
+
+NEXT WEEK: Week 8 is CI/CD Pipelines — you'll automate the entire process
+from git push to Kubernetes deployment using GitHub Actions. No more manual
+kubectl commands. But that's for next week. For now, make sure your cluster
+is running, your app auto-scales under load, and you can do a rolling update
+with zero downtime.
